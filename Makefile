@@ -2,6 +2,8 @@
 
 COMPOSE_FILE := deployments/docker-compose.yml
 PROTO_DIR := proto
+GOBIN := $(shell go env GOPATH)/bin
+export PATH := $(GOBIN):$(PATH)
 
 infra-up:
 	docker compose -f $(COMPOSE_FILE) up -d

@@ -1,0 +1,26 @@
+syntax = "proto3";
+package transit;
+option go_package = "github.com/briankim06/urban-goggles/proto/transit";
+
+message DelayEvent {
+  string agency_id = 1;
+  string trip_id = 2;
+  string route_id = 3;
+  string stop_id = 4;
+  int32 delay_seconds = 5;
+  int64 observed_at = 6;
+  int64 scheduled_arrival = 7;
+  int64 predicted_arrival = 8;
+  EventType type = 9;
+
+  enum EventType {
+    ARRIVAL_DELAY = 0;
+    DEPARTURE_DELAY = 1;
+    TRIP_CANCELLED = 2;
+    SKIP_STOP = 3;
+  }
+}
+
+message DelayEventBatch {
+  repeated DelayEvent events = 1;
+}

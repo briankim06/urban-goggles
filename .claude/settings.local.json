@@ -3,7 +3,20 @@
     "allow": [
       "Bash(docker info:*)",
       "Bash(make infra-up:*)",
-      "Bash(make infra-down:*)"
+      "Bash(make infra-down:*)",
+      "Bash(docker ps:*)",
+      "Bash(docker compose:*)",
+      "Bash(docker exec:*)",
+      "Bash(protoc --version)",
+      "Bash(brew list:*)",
+      "Bash(brew install:*)",
+      "Bash(echo $PATH)",
+      "Bash(curl -sSL -o /Users/yejun/MyProjects/transit_eng/proto/gtfs-realtime.proto https://raw.githubusercontent.com/google/transit/master/gtfs-realtime/proto/gtfs-realtime.proto)",
+      "Bash(make proto:*)",
+      "Bash(make build:*)",
+      "Bash(go get:*)",
+      "Bash(go mod:*)",
+      "Bash(go doc:*)"
     ]
   }
 }

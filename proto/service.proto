@@ -1,0 +1,70 @@
+syntax = "proto3";
+package transit;
+option go_package = "github.com/briankim06/urban-goggles/proto/transit";
+
+import "propagation.proto";
+
+service TransitPropagation {
+  rpc GetNetworkState(NetworkStateRequest) returns (NetworkStateResponse);
+  rpc GetRouteDelays(RouteDelaysRequest) returns (RouteDelaysResponse);
+  rpc PredictImpact(PredictImpactRequest) returns (PropagationResult);
+  rpc GetBlastRadius(BlastRadiusRequest) returns (BlastRadiusResponse);
+  rpc GetTransferReliability(TransferReliabilityRequest) returns (TransferReliabilityResponse);
+  rpc StreamAlerts(StreamAlertsRequest) returns (stream TransferImpact);
+}
+
+message NetworkStateRequest {}
+message NetworkStateResponse {
+  map<string, RouteState> routes = 1;
+  int64 as_of = 2;
+}
+message RouteState {
+  string route_id = 1;
+  repeated StopDelay delays = 2;
+}
+message StopDelay {
+  string stop_id = 1;
+  string stop_name = 2;
+  int32 delay_seconds = 3;
+  float confidence = 4;
+}
+
+message RouteDelaysRequest {
+  string route_id = 1;
+}
+message RouteDelaysResponse {
+  repeated StopDelay delays = 1;
+}
+
+message PredictImpactRequest {
+  string trip_id = 1;
+  string stop_id = 2;
+}
+
+message BlastRadiusRequest {
+  string station_id = 1;
+}
+message BlastRadiusResponse {
+  repeated PropagationResult cascades = 1;
+}
+
+message TransferReliabilityRequest {
+  string station_id = 1;
+  int32 hour_of_day = 2;
+}
+message TransferReliabilityResponse {
+  repeated TransferStats transfers = 1;
+}
+message TransferStats {
+  string from_route_id = 1;
+  string to_route_id = 2;
+  string station_id = 3;
+  float reliability_pct = 4;
+  float avg_delay_when_broken = 5;
+  int32 sample_count = 6;
+}
+
+message StreamAlertsRequest {
+  repeated string route_ids = 1;
+  repeated string station_ids = 2;
+}

@@ -1,0 +1,39 @@
+syntax = "proto3";
+package transit;
+option go_package = "github.com/briankim06/urban-goggles/proto/transit";
+
+message TransferImpact {
+  string from_trip_id = 1;
+  string from_route_id = 2;
+  string to_route_id = 3;
+  string station_id = 4;
+  int32 source_delay_seconds = 5;
+  int32 original_transfer_margin_seconds = 6;
+  int32 remaining_margin_seconds = 7;
+  ImpactLevel level = 8;
+  int64 detected_at = 9;
+  string next_viable_trip_id = 10;
+  int32 additional_wait_seconds = 11;
+
+  enum ImpactLevel {
+    AT_RISK = 0;
+    BROKEN = 1;
+  }
+}
+
+message PropagationResult {
+  string source_trip_id = 1;
+  string source_stop_id = 2;
+  int32 source_delay_seconds = 3;
+  repeated DownstreamImpact impacts = 4;
+  int64 computed_at = 5;
+}
+
+message DownstreamImpact {
+  string route_id = 1;
+  string stop_id = 2;
+  int32 predicted_additional_delay = 3;
+  float confidence = 4;
+  int32 hops_from_source = 5;
+  string impact_type = 6;
+}
