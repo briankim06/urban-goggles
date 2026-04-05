@@ -1,0 +1,41 @@
+agency_id: "mta"
+polling_default_interval: 15s
+kafka_brokers:
+  - "localhost:9092"
+kafka_topic: "delay-events"
+
+feeds:
+  - name: "ACE"
+    url: "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-ace"
+    poll_interval: 15s
+    routes: ["A", "C", "E", "SR"]
+  - name: "L"
+    url: "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-l"
+    poll_interval: 15s
+    routes: ["L"]
+
+  # Enable the rest for full coverage:
+  # - name: "1234567S"
+  #   url: "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs"
+  #   poll_interval: 15s
+  #   routes: ["1", "2", "3", "4", "5", "6", "7", "GS"]
+  # - name: "BDFM"
+  #   url: "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-bdfm"
+  #   poll_interval: 15s
+  #   routes: ["B", "D", "F", "M", "SF"]
+  # - name: "G"
+  #   url: "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-g"
+  #   poll_interval: 15s
+  #   routes: ["G"]
+  # - name: "JZ"
+  #   url: "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-jz"
+  #   poll_interval: 15s
+  #   routes: ["J", "Z"]
+  # - name: "NQRW"
+  #   url: "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-nqrw"
+  #   poll_interval: 15s
+  #   routes: ["N", "Q", "R", "W"]
+  # - name: "SIR"
+  #   url: "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-si"
+  #   poll_interval: 15s
+  #   routes: ["SI"]

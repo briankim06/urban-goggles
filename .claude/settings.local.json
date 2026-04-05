@@ -16,7 +16,11 @@
       "Bash(make build:*)",
       "Bash(go get:*)",
       "Bash(go mod:*)",
-      "Bash(go doc:*)"
+      "Bash(go doc:*)",
+      "Bash(go test:*)",
+      "Bash(curl:*)",
+      "Bash(timeout 12 go run ./cmd/consumer -brokers localhost:9092 -topic delay-events)",
+      "Bash(xargs -I{} kill -TERM {})"
     ]
   }
 }
