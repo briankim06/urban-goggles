@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(docker info:*)",
+      "Bash(make infra-up:*)",
+      "Bash(make infra-down:*)"
+    ]
+  }
+}
