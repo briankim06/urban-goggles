@@ -23,7 +23,11 @@
       "Bash(xargs -I{} kill -TERM {})",
       "Bash(chmod:*)",
       "Bash(make download-static:*)",
-      "Bash(make test:*)"
+      "Bash(make test:*)",
+      "Bash(go build:*)",
+      "Bash(timeout 6 go run ./cmd/delays -agency mta)",
+      "Bash(kill %1 %2)",
+      "Bash(xargs kill:*)"
     ]
   }
 }
