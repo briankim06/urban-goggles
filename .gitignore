@@ -1,0 +1,2 @@
+# MTA GTFS static CSVs — large and refreshable; use: make download-static
+data/gtfs_static/
