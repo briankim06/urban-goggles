@@ -1,4 +1,4 @@
-.PHONY: infra-up infra-down proto build run-ingestor run-processor run-server test
+.PHONY: infra-up infra-down proto build run-ingestor run-processor run-server test download-static
 
 COMPOSE_FILE := deployments/docker-compose.yml
 PROTO_DIR := proto
@@ -34,3 +34,6 @@ run-server:
 
 test:
 	go test ./... -v
+
+download-static:
+	./scripts/download_static.sh
