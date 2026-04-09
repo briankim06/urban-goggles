@@ -7,15 +7,18 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc"
 
 	"github.com/briankim06/urban-goggles/internal/graph"
+	_ "github.com/briankim06/urban-goggles/internal/metrics" // register metrics
 	"github.com/briankim06/urban-goggles/internal/propagation"
 	"github.com/briankim06/urban-goggles/internal/server"
 	"github.com/briankim06/urban-goggles/internal/state"
@@ -65,6 +68,16 @@ func main() {
 	go func() {
 		if err := alerts.RunKafkaConsumer(ctx, []string{*kafkaBroker}, transferImpactsTopic); err != nil {
 			logger.Error("alert consumer", "err", err)
+		}
+	}()
+
+	// Prometheus metrics endpoint.
+	go func() {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", promhttp.Handler())
+		logger.Info("metrics server starting", "addr", ":9092")
+		if err := http.ListenAndServe(":9092", mux); err != nil {
+			logger.Error("metrics server", "err", err)
 		}
 	}()
 

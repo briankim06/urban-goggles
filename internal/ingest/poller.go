@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/briankim06/urban-goggles/internal/metrics"
 	gtfsrt "github.com/briankim06/urban-goggles/proto/gtfsrt"
 	transit "github.com/briankim06/urban-goggles/proto/transit"
 	"google.golang.org/protobuf/proto"
@@ -82,8 +83,10 @@ func (p *Poller) Start(ctx context.Context) {
 }
 
 func (p *Poller) pollOnce(ctx context.Context) {
+	start := time.Now()
 	feed, err := p.fetch(ctx)
 	if err != nil {
+		metrics.IngestorPollErrors.Inc()
 		p.Logger.Warn("feed fetch failed", "err", err)
 		return
 	}
@@ -108,7 +111,9 @@ func (p *Poller) pollOnce(ctx context.Context) {
 			continue
 		}
 		atomic.AddUint64(&p.published, 1)
+		metrics.IngestorEventsTotal.WithLabelValues(ev.GetRouteId()).Inc()
 	}
+	metrics.IngestorPollDuration.Observe(time.Since(start).Seconds())
 	p.Logger.Debug("poll complete", "raw", len(raw), "emitted", len(changed))
 }
 

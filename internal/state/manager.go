@@ -11,6 +11,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/briankim06/urban-goggles/internal/graph"
+	"github.com/briankim06/urban-goggles/internal/metrics"
 	transit "github.com/briankim06/urban-goggles/proto/transit"
 )
 
@@ -194,7 +195,9 @@ func (m *DelayStateManager) GetAllActiveDelays(ctx context.Context, agencyID str
 // --- internal helpers ---
 
 func (m *DelayStateManager) getState(ctx context.Context, key string) (*DelayState, error) {
+	start := time.Now()
 	raw, err := m.rdb.Get(ctx, key).Bytes()
+	metrics.RedisOperationDuration.WithLabelValues("get").Observe(time.Since(start).Seconds())
 	if err != nil {
 		return nil, err
 	}
@@ -210,7 +213,10 @@ func (m *DelayStateManager) setState(ctx context.Context, key string, ds *DelayS
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)
 	}
-	return m.rdb.Set(ctx, key, data, keyTTL).Err()
+	start := time.Now()
+	err = m.rdb.Set(ctx, key, data, keyTTL).Err()
+	metrics.RedisOperationDuration.WithLabelValues("set").Observe(time.Since(start).Seconds())
+	return err
 }
 
 func abs32(x int32) int32 {

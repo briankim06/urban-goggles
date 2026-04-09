@@ -6,13 +6,17 @@ import (
 	"context"
 	"flag"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
 	"github.com/briankim06/urban-goggles/internal/ingest"
+	_ "github.com/briankim06/urban-goggles/internal/metrics" // register metrics
 )
 
 func main() {
@@ -40,6 +44,16 @@ func main() {
 	defer func() {
 		if err := pub.Close(); err != nil {
 			logger.Warn("kafka close", "err", err)
+		}
+	}()
+
+	// Prometheus metrics endpoint.
+	go func() {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", promhttp.Handler())
+		logger.Info("metrics server starting", "addr", ":9090")
+		if err := http.ListenAndServe(":9090", mux); err != nil {
+			logger.Error("metrics server", "err", err)
 		}
 	}()
 

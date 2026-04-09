@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/briankim06/urban-goggles/internal/graph"
+	"github.com/briankim06/urban-goggles/internal/metrics"
 	"github.com/briankim06/urban-goggles/internal/propagation"
 	"github.com/briankim06/urban-goggles/internal/state"
 	pb "github.com/briankim06/urban-goggles/proto/transit"
@@ -51,6 +52,11 @@ func NewTransitService(
 
 // GetNetworkState returns all active delays grouped by route.
 func (s *TransitService) GetNetworkState(ctx context.Context, _ *pb.NetworkStateRequest) (*pb.NetworkStateResponse, error) {
+	start := time.Now()
+	defer func() {
+		metrics.ServerGRPCRequests.WithLabelValues("GetNetworkState").Inc()
+		metrics.ServerGRPCDuration.WithLabelValues("GetNetworkState").Observe(time.Since(start).Seconds())
+	}()
 	delays, err := s.stateMgr.GetAllActiveDelays(ctx, s.agencyID)
 	if err != nil {
 		return nil, err
@@ -88,6 +94,11 @@ func (s *TransitService) GetNetworkState(ctx context.Context, _ *pb.NetworkState
 
 // GetRouteDelays returns delays for a single route.
 func (s *TransitService) GetRouteDelays(ctx context.Context, req *pb.RouteDelaysRequest) (*pb.RouteDelaysResponse, error) {
+	start := time.Now()
+	defer func() {
+		metrics.ServerGRPCRequests.WithLabelValues("GetRouteDelays").Inc()
+		metrics.ServerGRPCDuration.WithLabelValues("GetRouteDelays").Observe(time.Since(start).Seconds())
+	}()
 	delays, err := s.stateMgr.GetRouteDelays(ctx, s.agencyID, req.GetRouteId())
 	if err != nil {
 		return nil, err
@@ -125,6 +136,10 @@ func (s *TransitService) StreamAlerts(req *pb.StreamAlertsRequest, stream pb.Tra
 	}
 	hasFilter := len(routeFilter) > 0 || len(stationFilter) > 0
 
+	metrics.ServerGRPCRequests.WithLabelValues("StreamAlerts").Inc()
+	metrics.ServerActiveStreams.Inc()
+	defer metrics.ServerActiveStreams.Dec()
+
 	s.logger.Info("stream client connected",
 		"route_filter", req.GetRouteIds(),
 		"station_filter", req.GetStationIds(),
@@ -153,6 +168,11 @@ func (s *TransitService) StreamAlerts(req *pb.StreamAlertsRequest, stream pb.Tra
 // stop. It looks up the current delay from Redis, builds a synthetic
 // TransferImpact, and returns the cascading downstream predictions.
 func (s *TransitService) PredictImpact(ctx context.Context, req *pb.PredictImpactRequest) (*pb.PropagationResult, error) {
+	start := time.Now()
+	defer func() {
+		metrics.ServerGRPCRequests.WithLabelValues("PredictImpact").Inc()
+		metrics.ServerGRPCDuration.WithLabelValues("PredictImpact").Observe(time.Since(start).Seconds())
+	}()
 	tripID := req.GetTripId()
 	stopID := req.GetStopId()
 
@@ -193,6 +213,11 @@ func (s *TransitService) PredictImpact(ctx context.Context, req *pb.PredictImpac
 // GetBlastRadius finds all current delays at a station, runs propagation for
 // each, and returns the combined cascading impacts.
 func (s *TransitService) GetBlastRadius(ctx context.Context, req *pb.BlastRadiusRequest) (*pb.BlastRadiusResponse, error) {
+	start := time.Now()
+	defer func() {
+		metrics.ServerGRPCRequests.WithLabelValues("GetBlastRadius").Inc()
+		metrics.ServerGRPCDuration.WithLabelValues("GetBlastRadius").Observe(time.Since(start).Seconds())
+	}()
 	stationID := s.graph.ParentStationID(req.GetStationId())
 
 	// Get all routes serving this station.
@@ -232,6 +257,11 @@ func (s *TransitService) GetBlastRadius(ctx context.Context, req *pb.BlastRadius
 // GetTransferReliability returns historical reliability stats for transfers
 // at a station during a specific hour of day.
 func (s *TransitService) GetTransferReliability(ctx context.Context, req *pb.TransferReliabilityRequest) (*pb.TransferReliabilityResponse, error) {
+	start := time.Now()
+	defer func() {
+		metrics.ServerGRPCRequests.WithLabelValues("GetTransferReliability").Inc()
+		metrics.ServerGRPCDuration.WithLabelValues("GetTransferReliability").Observe(time.Since(start).Seconds())
+	}()
 	stationID := s.graph.ParentStationID(req.GetStationId())
 	hour := int(req.GetHourOfDay())
 
