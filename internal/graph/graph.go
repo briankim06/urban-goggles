@@ -26,6 +26,9 @@ type TransitGraph struct {
 	// TransfersByStop maps parent-station-ID → outbound transfers.
 	TransfersByStop map[string][]*Transfer
 
+	// RoutesAtStop maps parent-station-ID → set of route IDs serving it.
+	RoutesAtStop map[string]map[string]bool
+
 	// activeTrips is the set of trip IDs active on the loaded date.
 	activeTrips map[string]bool
 }
@@ -77,6 +80,7 @@ func BuildGraph(dataDir string, date time.Time) (*TransitGraph, error) {
 	// Build per-stop and per-trip indices (only for active trips).
 	byStop := make(map[string][]*ScheduledStopTime)
 	byTrip := make(map[string][]*ScheduledStopTime)
+	routesAtStop := make(map[string]map[string]bool)
 	for _, st := range allStopTimes {
 		if !activeTrips[st.TripID] {
 			continue
@@ -84,6 +88,10 @@ func BuildGraph(dataDir string, date time.Time) (*TransitGraph, error) {
 		parentID := parentStation(st.StopID, stops)
 		byStop[parentID] = append(byStop[parentID], st)
 		byTrip[st.TripID] = append(byTrip[st.TripID], st)
+		if routesAtStop[parentID] == nil {
+			routesAtStop[parentID] = make(map[string]bool)
+		}
+		routesAtStop[parentID][tripRoute[st.TripID]] = true
 	}
 	// Sort stop-level lists by departure time, trip-level by stop sequence.
 	for _, v := range byStop {
@@ -115,6 +123,7 @@ func BuildGraph(dataDir string, date time.Time) (*TransitGraph, error) {
 		StopTimesByStop: byStop,
 		StopTimesByTrip: byTrip,
 		TransfersByStop: xferByStop,
+		RoutesAtStop:    routesAtStop,
 		activeTrips:     activeTrips,
 	}
 
@@ -146,6 +155,11 @@ func parentStation(stopID string, stops map[string]*Stop) string {
 // packages once the graph is built.
 func (g *TransitGraph) ParentStationID(stopID string) string {
 	return parentStation(stopID, g.Stops)
+}
+
+// GetRoutesAtStop returns all route IDs that serve the given station.
+func (g *TransitGraph) GetRoutesAtStop(stopID string) map[string]bool {
+	return g.RoutesAtStop[parentStation(stopID, g.Stops)]
 }
 
 // GetTransfersFrom returns all outbound transfers from a station. The

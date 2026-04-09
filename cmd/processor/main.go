@@ -1,5 +1,6 @@
 // Command processor consumes DelayEvent messages from Kafka, maintains
-// reconciled delay state in Redis, and logs summary statistics.
+// reconciled delay state in Redis, detects broken transfer connections, and
+// publishes TransferImpact events to the transfer-impacts topic.
 package main
 
 import (
@@ -19,9 +20,12 @@ import (
 	"github.com/briankim06/urban-goggles/internal/graph"
 	"github.com/briankim06/urban-goggles/internal/ingest"
 	"github.com/briankim06/urban-goggles/internal/state"
+	"github.com/briankim06/urban-goggles/internal/transfer"
 	transit "github.com/briankim06/urban-goggles/proto/transit"
 	"google.golang.org/protobuf/proto"
 )
+
+const transferImpactsTopic = "transfer-impacts"
 
 func main() {
 	configPath := flag.String("config", "config.yaml", "path to config file")
@@ -55,6 +59,17 @@ func main() {
 
 	mgr := state.NewDelayStateManager(rdb, g, logger)
 
+	// Transfer impact Kafka publisher.
+	impactPub, err := transfer.NewKafkaImpactPublisher(cfg.KafkaBrokers, transferImpactsTopic, 10)
+	if err != nil {
+		logger.Error("impact publisher", "err", err)
+		os.Exit(1)
+	}
+	defer impactPub.Close()
+	logger.Info("transfer-impacts topic ready")
+
+	detector := transfer.NewTransferDetector(g, mgr, impactPub, logger)
+
 	// Kafka consumer.
 	sc := sarama.NewConfig()
 	sc.Consumer.Return.Errors = true
@@ -71,8 +86,9 @@ func main() {
 	defer cancel()
 
 	handler := &consumerHandler{
-		mgr:    mgr,
-		logger: logger,
+		mgr:      mgr,
+		detector: detector,
+		logger:   logger,
 	}
 
 	// Stats reporter.
@@ -99,8 +115,9 @@ func main() {
 
 // consumerHandler implements sarama.ConsumerGroupHandler.
 type consumerHandler struct {
-	mgr    *state.DelayStateManager
-	logger *slog.Logger
+	mgr      *state.DelayStateManager
+	detector *transfer.TransferDetector
+	logger   *slog.Logger
 }
 
 func (*consumerHandler) Setup(_ sarama.ConsumerGroupSession) error   { return nil }
@@ -117,6 +134,12 @@ func (h *consumerHandler) ConsumeClaim(sess sarama.ConsumerGroupSession, claim s
 		if err := h.mgr.ProcessEvent(sess.Context(), &ev); err != nil {
 			h.logger.Error("process event", "err", err, "trip", ev.GetTripId())
 		}
+
+		// Evaluate transfer impacts for this delay event.
+		if _, err := h.detector.EvaluateDelay(sess.Context(), &ev); err != nil {
+			h.logger.Error("evaluate delay", "err", err, "trip", ev.GetTripId())
+		}
+
 		sess.MarkMessage(msg, "")
 	}
 	return nil
