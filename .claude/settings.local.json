@@ -27,7 +27,11 @@
       "Bash(go build:*)",
       "Bash(timeout 6 go run ./cmd/delays -agency mta)",
       "Bash(kill %1 %2)",
-      "Bash(xargs kill:*)"
+      "Bash(xargs kill:*)",
+      "Bash(fuser 50051/tcp)",
+      "Bash(lsof -nP -iTCP:50051)",
+      "Bash(timeout 10 go run ./cmd/client -addr localhost:50052)",
+      "Bash(go vet:*)"
     ]
   }
 }

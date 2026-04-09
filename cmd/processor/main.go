@@ -1,6 +1,6 @@
 // Command processor consumes DelayEvent messages from Kafka, maintains
-// reconciled delay state in Redis, detects broken transfer connections, and
-// publishes TransferImpact events to the transfer-impacts topic.
+// reconciled delay state in Redis, detects broken transfer connections,
+// runs the propagation engine on broken transfers, and publishes results.
 package main
 
 import (
@@ -19,13 +19,17 @@ import (
 
 	"github.com/briankim06/urban-goggles/internal/graph"
 	"github.com/briankim06/urban-goggles/internal/ingest"
+	"github.com/briankim06/urban-goggles/internal/propagation"
 	"github.com/briankim06/urban-goggles/internal/state"
 	"github.com/briankim06/urban-goggles/internal/transfer"
-	transit "github.com/briankim06/urban-goggles/proto/transit"
+	pb "github.com/briankim06/urban-goggles/proto/transit"
 	"google.golang.org/protobuf/proto"
 )
 
-const transferImpactsTopic = "transfer-impacts"
+const (
+	transferImpactsTopic    = "transfer-impacts"
+	networkPredictionsTopic = "network-predictions"
+)
 
 func main() {
 	configPath := flag.String("config", "config.yaml", "path to config file")
@@ -68,6 +72,18 @@ func main() {
 	defer impactPub.Close()
 	logger.Info("transfer-impacts topic ready")
 
+	// Propagation engine + publisher.
+	histStore := propagation.NewHistoricalStore(rdb)
+	propEngine := propagation.NewPropagationEngine(g, mgr, histStore, logger)
+
+	predPub, err := propagation.NewKafkaPredictionPublisher(cfg.KafkaBrokers, networkPredictionsTopic, 10)
+	if err != nil {
+		logger.Error("prediction publisher", "err", err)
+		os.Exit(1)
+	}
+	defer predPub.Close()
+	logger.Info("network-predictions topic ready")
+
 	detector := transfer.NewTransferDetector(g, mgr, impactPub, logger)
 
 	// Kafka consumer.
@@ -86,9 +102,11 @@ func main() {
 	defer cancel()
 
 	handler := &consumerHandler{
-		mgr:      mgr,
-		detector: detector,
-		logger:   logger,
+		mgr:       mgr,
+		detector:  detector,
+		engine:    propEngine,
+		predPub:   predPub,
+		logger:    logger,
 	}
 
 	// Stats reporter.
@@ -117,6 +135,8 @@ func main() {
 type consumerHandler struct {
 	mgr      *state.DelayStateManager
 	detector *transfer.TransferDetector
+	engine   *propagation.PropagationEngine
+	predPub  *propagation.KafkaPredictionPublisher
 	logger   *slog.Logger
 }
 
@@ -125,7 +145,7 @@ func (*consumerHandler) Cleanup(_ sarama.ConsumerGroupSession) error { return ni
 
 func (h *consumerHandler) ConsumeClaim(sess sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
 	for msg := range claim.Messages() {
-		var ev transit.DelayEvent
+		var ev pb.DelayEvent
 		if err := proto.Unmarshal(msg.Value, &ev); err != nil {
 			h.logger.Warn("unmarshal", "err", err, "offset", msg.Offset)
 			sess.MarkMessage(msg, "")
@@ -136,13 +156,40 @@ func (h *consumerHandler) ConsumeClaim(sess sarama.ConsumerGroupSession, claim s
 		}
 
 		// Evaluate transfer impacts for this delay event.
-		if _, err := h.detector.EvaluateDelay(sess.Context(), &ev); err != nil {
+		impacts, err := h.detector.EvaluateDelay(sess.Context(), &ev)
+		if err != nil {
 			h.logger.Error("evaluate delay", "err", err, "trip", ev.GetTripId())
+		}
+
+		// Run propagation for broken transfers (async to not block consumption).
+		for _, impact := range impacts {
+			if impact.GetLevel() == pb.TransferImpact_BROKEN {
+				go h.runPropagation(sess.Context(), impact)
+			}
 		}
 
 		sess.MarkMessage(msg, "")
 	}
 	return nil
+}
+
+func (h *consumerHandler) runPropagation(ctx context.Context, impact *pb.TransferImpact) {
+	result, err := h.engine.Propagate(ctx, impact)
+	if err != nil {
+		h.logger.Error("propagation", "err", err)
+		return
+	}
+	if len(result.GetImpacts()) == 0 {
+		return
+	}
+	h.logger.Info("propagation result",
+		"source", impact.GetFromRouteId()+"→"+impact.GetToRouteId(),
+		"station", impact.GetStationId(),
+		"downstream_impacts", len(result.GetImpacts()),
+	)
+	if err := h.predPub.Publish(ctx, result); err != nil {
+		h.logger.Error("publish prediction", "err", err)
+	}
 }
 
 func reportStats(ctx context.Context, logger *slog.Logger, mgr *state.DelayStateManager, agencyID string) {
