@@ -65,9 +65,9 @@ func (d *TransferDetector) EvaluateDelay(ctx context.Context, ev *pb.DelayEvent)
 
 	// Time-of-day in seconds since midnight derived from the event's
 	// scheduled arrival (or observed_at as fallback).
-	scheduledArrSecs := todFromUnix(ev.GetScheduledArrival())
+	scheduledArrSecs := d.todFromUnix(ev.GetScheduledArrival())
 	if scheduledArrSecs == 0 {
-		scheduledArrSecs = todFromUnix(ev.GetObservedAt())
+		scheduledArrSecs = d.todFromUnix(ev.GetObservedAt())
 	}
 
 	var impacts []*pb.TransferImpact
@@ -210,12 +210,11 @@ func (d *TransferDetector) getConnectingDelay(ctx context.Context, agencyID, rou
 	return maxDelay
 }
 
-// todFromUnix converts a Unix timestamp to seconds since midnight in the local
-// timezone. Returns 0 if ts is 0.
-func todFromUnix(ts int64) int {
+// todFromUnix converts a Unix timestamp to seconds since midnight in the
+// agency's timezone. Returns 0 if ts is 0 (unset).
+func (d *TransferDetector) todFromUnix(ts int64) int {
 	if ts == 0 {
 		return 0
 	}
-	t := time.Unix(ts, 0)
-	return t.Hour()*3600 + t.Minute()*60 + t.Second()
+	return d.graph.SecsSinceMidnight(ts)
 }

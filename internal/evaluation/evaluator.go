@@ -98,7 +98,8 @@ func (e *Evaluator) TrackPrediction(ctx context.Context, src *pb.TransferImpact,
 	if res.GetComputedAt() == 0 {
 		now = time.Now()
 	}
-	hour := now.Hour()
+	// History buckets by agency-local hour, matching the engine's read side.
+	hour := now.In(e.graph.Location()).Hour()
 
 	// Direction of the receiving route, when derivable.
 	toDirection := -1

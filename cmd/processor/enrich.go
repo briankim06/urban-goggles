@@ -1,8 +1,6 @@
 package main
 
 import (
-	"time"
-
 	"github.com/briankim06/urban-goggles/internal/graph"
 	"github.com/briankim06/urban-goggles/internal/metrics"
 	pb "github.com/briankim06/urban-goggles/proto/transit"
@@ -41,13 +39,12 @@ func enrichEvent(g *graph.TransitGraph, ev *pb.DelayEvent) bool {
 		return false
 	}
 
-	// Predicted epoch → seconds since local midnight (process-local TZ, the
-	// repo-wide convention). The schedule uses GTFS service-day seconds that
-	// can exceed 86400 (past-midnight trips), and a prediction can fall on
-	// the other side of midnight from its scheduled time — so pick the delay
-	// candidate among {raw, raw±86400} with the smallest magnitude.
-	pt := time.Unix(ev.GetPredictedArrival(), 0)
-	predTod := int64(pt.Hour()*3600 + pt.Minute()*60 + pt.Second())
+	// Predicted epoch → seconds since midnight in the agency's timezone. The
+	// schedule uses GTFS service-day seconds that can exceed 86400
+	// (past-midnight trips), and a prediction can fall on the other side of
+	// midnight from its scheduled time — so pick the delay candidate among
+	// {raw, raw±86400} with the smallest magnitude.
+	predTod := int64(g.SecsSinceMidnight(ev.GetPredictedArrival()))
 	raw := predTod - int64(schedSecs)
 	best := raw
 	for _, cand := range []int64{raw - 86400, raw + 86400} {

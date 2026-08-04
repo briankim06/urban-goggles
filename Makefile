@@ -5,9 +5,9 @@ PROTO_DIR := proto
 GOBIN := $(shell go env GOPATH)/bin
 export PATH := $(GOBIN):$(PATH)
 
-# All time-of-day math (schedule matching, headways, transfer margins) uses
-# the process-local timezone, which must match the agency's. Override with
-# e.g. `make run-server TZ=America/Chicago`.
+# Schedule math uses the agency timezone from agency.txt, falling back to
+# the process-local timezone when it is absent. Pinning TZ here keeps logs
+# and the fallback consistent. Override with e.g. `make run-server TZ=...`.
 TZ ?= America/New_York
 
 infra-up:

@@ -90,7 +90,7 @@ func (e *PropagationEngine) Propagate(ctx context.Context, impact *pb.TransferIm
 		ComputedAt:         time.Now().Unix(),
 	}
 
-	tod := secsSinceMidnight(impact.GetDetectedAt())
+	tod := e.graph.SecsSinceMidnight(impact.GetDetectedAt())
 	w := &walk{
 		pq:      &impactQueue{},
 		visited: make(map[string]bool),
@@ -323,7 +323,7 @@ func (e *PropagationEngine) estimateInitialDelay(
 		scheduleEst = float64(impact.GetSourceDelaySeconds())
 	} else {
 		scheduleEst = float64(impact.GetAdditionalWaitSeconds())
-		tod := secsSinceMidnight(impact.GetDetectedAt())
+		tod := e.graph.SecsSinceMidnight(impact.GetDetectedAt())
 		hw, hwOK := e.graph.GetScheduledHeadway(impact.GetToRouteId(), directionID, impact.GetStationId(), tod)
 		if hwOK {
 			if half := hw / 2; half > scheduleEst {
@@ -347,16 +347,6 @@ func (e *PropagationEngine) estimateInitialDelay(
 	}
 	wgt := float64(histCount) / (float64(histCount) + shrinkageK)
 	return int32(math.Round(wgt*histAvg + (1-wgt)*scheduleEst))
-}
-
-// secsSinceMidnight converts a Unix timestamp to seconds since midnight in
-// local time, falling back to the current time when ts is zero.
-func secsSinceMidnight(ts int64) int {
-	t := time.Now()
-	if ts > 0 {
-		t = time.Unix(ts, 0)
-	}
-	return t.Hour()*3600 + t.Minute()*60 + t.Second()
 }
 
 // --- priority queue ---
