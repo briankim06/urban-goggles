@@ -52,6 +52,11 @@ func buildTestGraph() *graph.TransitGraph {
 			{TripID: "trip_L2", StopID: "S1", ArrivalSecs: 29160, DepartureSecs: 29160, StopSequence: 1},
 		},
 	}
+	// Per-trip index, needed by tripDelayAt's GetScheduledStopTime lookup.
+	stopTimesByTrip := map[string][]*graph.ScheduledStopTime{}
+	for _, st := range stopTimes["S1"] {
+		stopTimesByTrip[st.TripID] = []*graph.ScheduledStopTime{st}
+	}
 	transfers := map[string][]*graph.Transfer{
 		"S1": {
 			{FromStopID: "S1", ToStopID: "S1", TransferType: 2, MinTransferTime: 120},
@@ -67,7 +72,7 @@ func buildTestGraph() *graph.TransitGraph {
 		TripRoute:       tripRoute,
 		TripDirection:   tripDir,
 		StopTimesByStop: stopTimes,
-		StopTimesByTrip: map[string][]*graph.ScheduledStopTime{},
+		StopTimesByTrip: stopTimesByTrip,
 		TransfersByStop: transfers,
 		RoutesAtStop:    routesAtStop,
 	}
@@ -309,5 +314,92 @@ func TestEvaluateDelay_OvernightTransfer(t *testing.T) {
 	}
 	if imp.EarliestCatchSecs != 88560 {
 		t.Errorf("earliest_catch = %d, want 88560", imp.EarliestCatchSecs)
+	}
+}
+
+// TestEvaluateDelay_NeverViablePairIgnored: a schedule pair whose margin is
+// below min_transfer_time was never a real connection — it must not go
+// BROKEN on a trivial delay. The baseline is the first VIABLE departure.
+func TestEvaluateDelay_NeverViablePairIgnored(t *testing.T) {
+	rdb := skipIfNoRedis(t)
+	defer rdb.Close()
+	ctx := context.Background()
+	rdb.FlushDB(ctx)
+
+	g := buildTestGraph()
+	// Insert an L trip at 28900 — only 100s after the A arrival, below the
+	// 120s min transfer time: an artifact no passenger could catch.
+	l0 := &graph.ScheduledStopTime{TripID: "trip_L0", StopID: "S1", ArrivalSecs: 28900, DepartureSecs: 28900, StopSequence: 1}
+	g.TripRoute["trip_L0"] = "L"
+	g.TripDirection["trip_L0"] = 0
+	g.StopTimesByTrip["trip_L0"] = []*graph.ScheduledStopTime{l0}
+	s1 := g.StopTimesByStop["S1"]
+	g.StopTimesByStop["S1"] = append([]*graph.ScheduledStopTime{s1[0], l0}, s1[1:]...)
+
+	mgr := state.NewDelayStateManager(rdb, g, nil)
+	det := NewTransferDetector(g, mgr, nil, nil)
+
+	// 30s delay: previously the 100s-margin artifact went BROKEN
+	// (remaining 70 < 120). Now the baseline is trip_L1 (margin 180) →
+	// remaining 150 → AT_RISK.
+	ev := &pb.DelayEvent{
+		AgencyId: "test", TripId: "trip_A1", RouteId: "A", StopId: "S1",
+		DelaySeconds: 30, ObservedAt: unixAt(8, 0, 0), ScheduledArrival: unixAt(8, 0, 0),
+	}
+	impacts, err := det.EvaluateDelay(ctx, ev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(impacts) == 0 {
+		t.Fatal("expected an impact against the viable connection")
+	}
+	imp := impacts[0]
+	if imp.Level == pb.TransferImpact_BROKEN {
+		t.Error("never-viable schedule artifact classified BROKEN")
+	}
+	if imp.OriginalTransferMarginSeconds != 180 {
+		t.Errorf("margin = %d, want 180 (the viable trip_L1 connection, not the 100s artifact)",
+			imp.OriginalTransferMarginSeconds)
+	}
+}
+
+// TestEvaluateDelay_EarlyConnectingTrainTightens: an early-running
+// connection shrinks the real margin — previously negative delays were
+// ignored and this scenario was misclassified AT_RISK.
+func TestEvaluateDelay_EarlyConnectingTrainTightens(t *testing.T) {
+	rdb := skipIfNoRedis(t)
+	defer rdb.Close()
+	ctx := context.Background()
+	rdb.FlushDB(ctx)
+
+	g := buildTestGraph()
+	mgr := state.NewDelayStateManager(rdb, g, nil)
+	det := NewTransferDetector(g, mgr, nil, nil)
+
+	// The connection trip runs 60s early.
+	if err := mgr.ProcessEvent(ctx, &pb.DelayEvent{
+		AgencyId: "test", TripId: "trip_L1", RouteId: "L", StopId: "S1",
+		DelaySeconds: -60, ObservedAt: unixAt(8, 0, 0),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A 30s source delay: remaining = 180 - 30 - 60 = 90 < 120 → BROKEN.
+	ev := &pb.DelayEvent{
+		AgencyId: "test", TripId: "trip_A1", RouteId: "A", StopId: "S1",
+		DelaySeconds: 30, ObservedAt: unixAt(8, 0, 1), ScheduledArrival: unixAt(8, 0, 0),
+	}
+	impacts, err := det.EvaluateDelay(ctx, ev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(impacts) == 0 {
+		t.Fatal("expected impact")
+	}
+	if impacts[0].Level != pb.TransferImpact_BROKEN {
+		t.Errorf("level = %v, want BROKEN (early connecting train tightens the margin)", impacts[0].Level)
+	}
+	if impacts[0].RemainingMarginSeconds != 90 {
+		t.Errorf("remaining = %d, want 90", impacts[0].RemainingMarginSeconds)
 	}
 }

@@ -92,30 +92,25 @@ func (d *TransferDetector) EvaluateDelay(ctx context.Context, ev *pb.DelayEvent)
 				continue
 			}
 
-			// Find the next departure on toRoute from destStation after the
-			// original scheduled arrival of the delayed trip. Early-morning
-			// arrivals may connect to the previous service day's 24:xx+
-			// trips, so margins are computed against the effective
-			// time-of-day the lookup used.
-			deps, effTod := d.graph.NextDeparturesAfter(destStation, toRoute, scheduledArrSecs, 3)
+			// Resolve the effective frame (early-morning arrivals may
+			// connect to the previous service day's 24:xx+ trips), then
+			// take the first departure the passenger could viably make per
+			// schedule: margin >= minXfer by construction, so a schedule
+			// artifact that was never a real connection cannot be "broken".
+			_, effTod := d.graph.NextDeparturesAfter(destStation, toRoute, scheduledArrSecs, 1)
+			deps := d.graph.GetNextDepartures(destStation, toRoute, effTod+minXferTime, 3)
 			if len(deps) == 0 {
-				continue // no service on connecting route
+				continue // no viable service on connecting route
 			}
 			nextDep := deps[0]
 
 			originalMargin := int32(nextDep.DepartureSecs - effTod)
-			if originalMargin < 0 {
-				continue // departure was before arrival — not a real connection
-			}
 
-			remainingMargin := originalMargin - ev.GetDelaySeconds()
-
-			// Check if connecting route is also delayed at this station.
-			connectingDelay := d.getConnectingDelay(ctx, ev.GetAgencyId(), toRoute, destStation)
-			if connectingDelay > 0 {
-				// Connecting train is also late → effective margin loss is reduced.
-				remainingMargin += connectingDelay
-			}
+			// The connection is a specific trip — use its observed delay,
+			// signed: a late connecting train widens the effective margin,
+			// an early-running one tightens it.
+			connectingDelay := d.tripDelayAt(ctx, ev.GetAgencyId(), nextDep.TripID, destStation)
+			remainingMargin := originalMargin - ev.GetDelaySeconds() + connectingDelay
 
 			var level pb.TransferImpact_ImpactLevel
 			if remainingMargin < int32(minXferTime) {
@@ -196,24 +191,19 @@ func (d *TransferDetector) EvaluateDelay(ctx context.Context, ev *pb.DelayEvent)
 	return impacts, nil
 }
 
-// getConnectingDelay checks if the connecting route has an active delay at the
-// destination station (or upstream). Returns the delay in seconds, or 0.
-func (d *TransferDetector) getConnectingDelay(ctx context.Context, agencyID, routeID, stationID string) int32 {
-	// Check all delay keys for this route at the destination station. We look
-	// for any trip on the connecting route whose stop matches this station.
-	delays, err := d.stateMgr.GetRouteDelays(ctx, agencyID, routeID)
-	if err != nil {
+// tripDelayAt returns the observed signed delay of a specific trip at a
+// station, 0 when no observation exists. One GET — replaces the previous
+// route-wide SCAN per transfer pair.
+func (d *TransferDetector) tripDelayAt(ctx context.Context, agencyID, tripID, stationID string) int32 {
+	row, ok := d.graph.GetScheduledStopTime(tripID, stationID)
+	if !ok {
 		return 0
 	}
-	parentID := d.graph.ParentStationID(stationID)
-	var maxDelay int32
-	for _, ds := range delays {
-		dsParent := d.graph.ParentStationID(ds.StopID)
-		if dsParent == parentID && ds.DelaySeconds > maxDelay {
-			maxDelay = ds.DelaySeconds
-		}
+	ds, err := d.stateMgr.GetDelay(ctx, agencyID, tripID, row.StopID)
+	if err != nil || ds == nil {
+		return 0
 	}
-	return maxDelay
+	return ds.DelaySeconds
 }
 
 // todFromUnix converts a Unix timestamp to seconds since midnight in the
