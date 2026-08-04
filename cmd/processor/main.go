@@ -21,6 +21,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/briankim06/urban-goggles/internal/evaluation"
 	"github.com/briankim06/urban-goggles/internal/graph"
 	"github.com/briankim06/urban-goggles/internal/ingest"
 	"github.com/briankim06/urban-goggles/internal/metrics"
@@ -85,6 +86,12 @@ func main() {
 	histStore := propagation.NewHistoricalStore(rdb)
 	propEngine := propagation.NewPropagationEngine(g, mgr, histStore, logger)
 
+	// Prediction evaluator: tracks predictions, matches them against later
+	// observed delays, and feeds real outcomes back into the history store.
+	evaluator := evaluation.NewEvaluator(
+		evaluation.NewPendingStore(rdb), g, mgr, histStore, cfg.AgencyID, logger,
+	)
+
 	predPub, err := propagation.NewKafkaPredictionPublisher(cfg.KafkaBrokers, networkPredictionsTopic, 10)
 	if err != nil {
 		logger.Error("prediction publisher", "err", err)
@@ -126,6 +133,7 @@ func main() {
 		detector:  detector,
 		engine:    propEngine,
 		predPub:   predPub,
+		eval:      evaluator,
 		catchUp:   &catchUp,
 		logger:    logger,
 	}
@@ -142,6 +150,12 @@ func main() {
 	go func() {
 		defer wg.Done()
 		monitorLag(ctx, logger, client, cfg.KafkaTopic, &catchUp)
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		evaluator.RunSweeper(ctx, 30*time.Second)
 	}()
 
 	// Consume loop — re-enters on rebalance.
@@ -164,6 +178,7 @@ type consumerHandler struct {
 	detector *transfer.TransferDetector
 	engine   *propagation.PropagationEngine
 	predPub  *propagation.KafkaPredictionPublisher
+	eval     *evaluation.Evaluator
 	catchUp  *atomic.Bool
 	logger   *slog.Logger
 }
@@ -193,6 +208,14 @@ func (h *consumerHandler) ConsumeClaim(sess sarama.ConsumerGroupSession, claim s
 		}
 		if err := h.mgr.ProcessEvent(sess.Context(), &ev); err != nil {
 			h.logger.Error("process event", "err", err, "trip", ev.GetTripId())
+		}
+
+		// Match this event against pending predictions. Runs even in
+		// catch-up mode: catch-up skips generating predictions, but the
+		// ones already in flight must still be verified or every lag spike
+		// would falsify them.
+		if err := h.eval.OnDelayEvent(sess.Context(), &ev); err != nil {
+			h.logger.Warn("evaluate prediction match", "err", err, "trip", ev.GetTripId())
 		}
 
 		// In catch-up mode, skip expensive transfer detection and propagation.
@@ -226,6 +249,9 @@ func (h *consumerHandler) runPropagation(ctx context.Context, impact *pb.Transfe
 	metrics.ProcessorPropagationFanOut.Observe(float64(len(result.GetImpacts())))
 	if len(result.GetImpacts()) == 0 {
 		return
+	}
+	if err := h.eval.TrackPrediction(ctx, impact, result); err != nil {
+		h.logger.Warn("track prediction", "err", err)
 	}
 	h.logger.Info("propagation result",
 		"source", impact.GetFromRouteId()+"→"+impact.GetToRouteId(),

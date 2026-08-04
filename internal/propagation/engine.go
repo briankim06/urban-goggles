@@ -79,13 +79,13 @@ func (e *PropagationEngine) Propagate(ctx context.Context, impact *pb.TransferIm
 	}
 
 	// Check historical data for a better prediction.
-	hour := time.Now().Hour()
+	hour := secsSinceMidnight(impact.GetDetectedAt()) / 3600 % 24
 	histAvg, histCount, _ := e.history.GetAverageImpact(
 		ctx, impact.GetFromRouteId(), toRoute, stationID, hour,
 	)
 
 	// Seed the priority queue with the first downstream stop.
-	initialDelay := e.estimateInitialDelay(sourceDelay, histAvg, histCount)
+	initialDelay := e.estimateInitialDelay(impact, directionID, histAvg, histCount)
 	pq := &impactQueue{}
 	heap.Init(pq)
 	heap.Push(pq, &queueItem{
@@ -152,18 +152,6 @@ func (e *PropagationEngine) Propagate(ctx context.Context, impact *pb.TransferIm
 		_ = stopName // used for potential debug logging
 	}
 
-	// Record this propagation as a historical observation.
-	totalImpact := int32(0)
-	for _, imp := range result.GetImpacts() {
-		if imp.GetPredictedAdditionalDelay() > totalImpact {
-			totalImpact = imp.GetPredictedAdditionalDelay()
-		}
-	}
-	_ = e.history.RecordObservation(ctx,
-		impact.GetFromRouteId(), toRoute, stationID, hour,
-		int(sourceDelay), int(totalImpact),
-	)
-
 	e.logger.Debug("propagation complete",
 		"source", impact.GetFromRouteId()+"→"+toRoute,
 		"station", stationID,
@@ -227,15 +215,36 @@ func (e *PropagationEngine) propagateTransfers(
 }
 
 // estimateInitialDelay computes the predicted additional delay on the first
-// downstream stop. If historical data is available, blend it with the model.
-func (e *PropagationEngine) estimateInitialDelay(sourceDelay int32, histAvg float64, histCount int) int32 {
-	modelDelay := float64(sourceDelay) * loadIncreasePct * dwellElasticity
-	if histCount >= 5 {
-		// Weight historical average more heavily when we have enough data.
-		blend := 0.6*histAvg + 0.4*modelDelay
-		return int32(math.Round(blend))
+// downstream stop. The primary signal is schedule-based: the wait until the
+// next viable trip on the receiving route (from the detector), guarded by
+// half the scheduled headway in case the detector understated the wait. When
+// neither is available, fall back to the legacy load/dwell linear model.
+// Historical observations, when plentiful, are blended in at 60%.
+func (e *PropagationEngine) estimateInitialDelay(impact *pb.TransferImpact, directionID int, histAvg float64, histCount int) int32 {
+	scheduleEst := float64(impact.GetAdditionalWaitSeconds())
+	tod := secsSinceMidnight(impact.GetDetectedAt())
+	if hw, ok := e.graph.GetScheduledHeadway(impact.GetToRouteId(), directionID, impact.GetStationId(), tod); ok {
+		if half := hw / 2; half > scheduleEst {
+			scheduleEst = half
+		}
 	}
-	return int32(math.Round(modelDelay))
+	if scheduleEst <= 0 {
+		scheduleEst = float64(impact.GetSourceDelaySeconds()) * loadIncreasePct * dwellElasticity
+	}
+	if histCount >= 5 {
+		return int32(math.Round(0.6*histAvg + 0.4*scheduleEst))
+	}
+	return int32(math.Round(scheduleEst))
+}
+
+// secsSinceMidnight converts a Unix timestamp to seconds since midnight in
+// local time, falling back to the current time when ts is zero.
+func secsSinceMidnight(ts int64) int {
+	t := time.Now()
+	if ts > 0 {
+		t = time.Unix(ts, 0)
+	}
+	return t.Hour()*3600 + t.Minute()*60 + t.Second()
 }
 
 // --- priority queue ---

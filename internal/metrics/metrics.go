@@ -125,6 +125,47 @@ var (
 	)
 )
 
+// Evaluation metrics — prediction accuracy feedback loop.
+var (
+	EvalPredictionsTracked = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "eval_predictions_tracked_total",
+			Help: "Total number of downstream-impact predictions tracked for verification.",
+		},
+	)
+
+	EvalPredictionsFinalized = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "eval_predictions_finalized_total",
+			Help: "Total number of predictions finalized, by outcome.",
+		},
+		[]string{"outcome"}, // verified | falsified
+	)
+
+	EvalPredictionAbsError = prometheus.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "eval_prediction_abs_error_seconds",
+			Help:    "Absolute error between predicted and observed additional delay.",
+			Buckets: []float64{5, 15, 30, 60, 120, 300, 600, 1200},
+		},
+	)
+
+	EvalPredictionSquaredError = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "eval_prediction_squared_error_seconds_total",
+			Help: "Sum of squared prediction errors; divide by finalized count and take the square root for RMSE.",
+		},
+	)
+
+	EvalPredictionsByConfidence = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "eval_predictions_by_confidence_total",
+			Help: "Finalized predictions by confidence bucket and outcome, for calibration curves.",
+		},
+		[]string{"confidence_bucket", "outcome"},
+	)
+)
+
 func init() {
 	prometheus.MustRegister(
 		// Ingestor
@@ -146,5 +187,11 @@ func init() {
 		RedisKeysTotal,
 		// Kafka
 		KafkaConsumerLag,
+		// Evaluation
+		EvalPredictionsTracked,
+		EvalPredictionsFinalized,
+		EvalPredictionAbsError,
+		EvalPredictionSquaredError,
+		EvalPredictionsByConfidence,
 	)
 }
