@@ -127,6 +127,14 @@ func TestEvaluateDelay_BrokenTransfer(t *testing.T) {
 	if imp.AdditionalWaitSeconds != 180 {
 		t.Errorf("additional_wait = %d, want 180", imp.AdditionalWaitSeconds)
 	}
+	// Schedule frame for realized-wait evaluation: missed connection at
+	// 28980, earliest catch = 28800 + 120 delay + 120 min transfer = 29040.
+	if imp.SchedConnectionDepartureSecs != 28980 {
+		t.Errorf("sched_connection_departure = %d, want 28980", imp.SchedConnectionDepartureSecs)
+	}
+	if imp.EarliestCatchSecs != 29040 {
+		t.Errorf("earliest_catch = %d, want 29040", imp.EarliestCatchSecs)
+	}
 	t.Logf("impact: %s→%s level=%v margin=%ds additional_wait=%ds",
 		imp.FromRouteId, imp.ToRouteId, imp.Level,
 		imp.RemainingMarginSeconds, imp.AdditionalWaitSeconds)
@@ -294,5 +302,12 @@ func TestEvaluateDelay_OvernightTransfer(t *testing.T) {
 	}
 	if imp.AdditionalWaitSeconds != 900 {
 		t.Errorf("additional_wait = %d, want 900", imp.AdditionalWaitSeconds)
+	}
+	// The frame stays in the effective (post-midnight) representation.
+	if imp.SchedConnectionDepartureSecs != 88500 {
+		t.Errorf("sched_connection_departure = %d, want 88500", imp.SchedConnectionDepartureSecs)
+	}
+	if imp.EarliestCatchSecs != 88560 {
+		t.Errorf("earliest_catch = %d, want 88560", imp.EarliestCatchSecs)
 	}
 }

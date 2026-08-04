@@ -126,14 +126,18 @@ func (d *TransferDetector) EvaluateDelay(ctx context.Context, ev *pb.DelayEvent)
 				continue // transfer is fine
 			}
 
-			// For broken transfers, find next viable departure.
+			// For broken transfers, find next viable departure and record
+			// the schedule frame so the evaluator can later compute the
+			// passenger's realized wait.
 			var nextViableTripID string
-			var additionalWait int32
+			var additionalWait, schedConnDep, earliestCatchSecs int32
 			if level == pb.TransferImpact_BROKEN {
 				// earliestCatch is already in the effective frame, so the
 				// plain lookup is correct even past 86400.
 				predictedArrSecs := effTod + int(ev.GetDelaySeconds())
 				earliestCatch := predictedArrSecs + minXferTime
+				schedConnDep = int32(nextDep.DepartureSecs)
+				earliestCatchSecs = int32(earliestCatch)
 				viableDeps := d.graph.GetNextDepartures(destStation, toRoute, earliestCatch, 1)
 				if len(viableDeps) > 0 {
 					nextViableTripID = viableDeps[0].TripID
@@ -163,6 +167,8 @@ func (d *TransferDetector) EvaluateDelay(ctx context.Context, ev *pb.DelayEvent)
 				DetectedAt:                    time.Now().Unix(),
 				NextViableTripId:              nextViableTripID,
 				AdditionalWaitSeconds:         additionalWait,
+				SchedConnectionDepartureSecs:  schedConnDep,
+				EarliestCatchSecs:             earliestCatchSecs,
 			}
 			impacts = append(impacts, impact)
 

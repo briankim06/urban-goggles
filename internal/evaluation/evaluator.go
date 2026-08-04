@@ -166,9 +166,11 @@ func (e *Evaluator) TrackPrediction(ctx context.Context, src *pb.TransferImpact,
 			StationID:       imp.GetStopId(), // engine records parent station IDs
 			SourceStation:   e.graph.ParentStationID(src.GetStationId()),
 			Direction:       direction,
-			SourceDelaySecs: src.GetSourceDelaySeconds(),
-			PredictedSecs:   imp.GetPredictedAdditionalDelay(),
-			BaselineSecs:    baselines[imp.GetRouteId()+":"+imp.GetStopId()],
+			SourceDelaySecs:   src.GetSourceDelaySeconds(),
+			PredictedSecs:     imp.GetPredictedAdditionalDelay(),
+			BaselineSecs:      baselines[imp.GetRouteId()+":"+imp.GetStopId()],
+			SchedConnDepSecs:  src.GetSchedConnectionDepartureSecs(),
+			EarliestCatchSecs: src.GetEarliestCatchSecs(),
 			Confidence:      float64(imp.GetConfidence()),
 			Hops:            imp.GetHopsFromSource(),
 			Hour:            hour,
@@ -286,6 +288,46 @@ func (e *Evaluator) RunSweeper(ctx context.Context, interval time.Duration) {
 	}
 }
 
+// realizedWait computes the passenger-experienced additional wait for a
+// primary pending: the first train on the receiving route that was actually
+// boardable (scheduled departure plus its observed delay, at or after the
+// passenger's earliest catchable time) versus the scheduled connection. A
+// candidate with no delay observation ran on time — absence of train delay
+// is signal here, not a falsification. A cancelled candidate leaves no
+// delay keys and counts as on-time-boardable — accepted first-order error.
+// Returns ok=false when no boardable candidate exists within the horizon.
+func (e *Evaluator) realizedWait(ctx context.Context, p *PendingPrediction) (int32, bool) {
+	// SchedConnDepSecs is already in the detector's effective frame, so the
+	// plain schedule lookup is correct even past 86400.
+	deps := e.graph.GetNextDepartures(p.SourceStation, p.RouteID, int(p.SchedConnDepSecs), 10)
+	horizon := int(p.EarliestCatchSecs) + predictionWindowSecs
+	for _, st := range deps {
+		if st.DepartureSecs > horizon {
+			break
+		}
+		if p.Direction >= 0 {
+			if d, ok := e.graph.TripDirection[st.TripID]; ok && d != p.Direction {
+				continue
+			}
+		}
+		var delay int32
+		if row, ok := e.graph.GetScheduledStopTime(st.TripID, p.SourceStation); ok {
+			if ds, err := e.state.GetDelay(ctx, p.AgencyID, st.TripID, row.StopID); err == nil && ds != nil {
+				delay = ds.DelaySeconds
+			}
+		}
+		realized := st.DepartureSecs + int(delay)
+		if realized >= int(p.EarliestCatchSecs) {
+			wait := int32(realized) - p.SchedConnDepSecs
+			if wait < 0 {
+				wait = 0
+			}
+			return wait, true
+		}
+	}
+	return 0, false
+}
+
 // sweepOnce pops expired predictions and finalizes them: outcome metrics for
 // all, plus a historical observation for primaries. A falsified prediction
 // records its (possibly zero) observed outcome — real outcomes, not
@@ -296,6 +338,17 @@ func (e *Evaluator) sweepOnce(ctx context.Context, now time.Time) error {
 		return err
 	}
 	for _, p := range expired {
+		// Primaries predict passenger wait, so their outcome is the
+		// realized wait, not observed train delay. Pendings without a
+		// schedule frame (pre-migration, or self-propagation impacts where
+		// the train carries its own delay) keep the event-matched outcome.
+		if p.IsPrimary && p.SchedConnDepSecs > 0 {
+			if wait, ok := e.realizedWait(ctx, p); ok {
+				p.ObservedMax = wait
+				p.Matched = true
+			}
+		}
+
 		verified := p.ObservedMax >= verifyMinSeconds &&
 			float64(p.ObservedMax) >= verifyRatio*float64(p.PredictedSecs)
 		outcome := "falsified"

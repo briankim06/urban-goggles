@@ -23,9 +23,15 @@ func skipIfNoRedis(t *testing.T) *redis.Client {
 	return rdb
 }
 
-// buildEvalGraph provides parent stations S1-S3 and trips on route L in both
-// directions plus a G trip, enough for matching and direction checks.
+// buildEvalGraph provides parent stations S1-S3, trips on route L in both
+// directions plus a G trip, and an L schedule at the S1 transfer station
+// (el_1 at 30000s = the missed connection, el_2 at 30900s = next viable)
+// for realized-wait computation.
 func buildEvalGraph() *graph.TransitGraph {
+	elSched := map[string][]*graph.ScheduledStopTime{
+		"el_1": {{TripID: "el_1", StopID: "S1", StopSequence: 1, ArrivalSecs: 30000, DepartureSecs: 30000}},
+		"el_2": {{TripID: "el_2", StopID: "S1", StopSequence: 1, ArrivalSecs: 30900, DepartureSecs: 30900}},
+	}
 	return &graph.TransitGraph{
 		Stops: map[string]*graph.Stop{
 			"S1":  {ID: "S1", Name: "First", LocationType: 1},
@@ -37,12 +43,20 @@ func buildEvalGraph() *graph.TransitGraph {
 			"trip_L1":   "L",
 			"trip_Lrev": "L",
 			"trip_G1":   "G",
+			"el_1":      "L",
+			"el_2":      "L",
 		},
 		TripDirection: map[string]int{
 			"trip_L1":   0,
 			"trip_Lrev": 1,
 			"trip_G1":   0,
+			"el_1":      0,
+			"el_2":      0,
 		},
+		StopTimesByStop: map[string][]*graph.ScheduledStopTime{
+			"S1": {elSched["el_1"][0], elSched["el_2"][0]},
+		},
+		StopTimesByTrip: elSched,
 	}
 }
 
@@ -85,6 +99,9 @@ func testResult(now time.Time) (*pb.TransferImpact, *pb.PropagationResult) {
 		SourceDelaySeconds: 300,
 		NextViableTripId:   "trip_L1",
 		DetectedAt:         now.Unix(),
+		// Schedule frame matching buildEvalGraph's L schedule at S1.
+		SchedConnectionDepartureSecs: 30000,
+		EarliestCatchSecs:            30360,
 	}
 	res := &pb.PropagationResult{
 		SourceTripId:       "trip_A1",
@@ -525,5 +542,74 @@ func TestAdd_IndexKeyHasTTL(t *testing.T) {
 	}
 	if ttl <= 0 {
 		t.Errorf("index ZSET has no TTL (%v) — leaked members would live forever", ttl)
+	}
+}
+
+func framedPrimary(now time.Time) *PendingPrediction {
+	return &PendingPrediction{
+		ID: "A:L:S2:20:0", AgencyID: "MTA", FromRoute: "A", RouteID: "L", StationID: "S2",
+		SourceStation: "S1", Direction: 0,
+		SourceDelaySecs: 300, PredictedSecs: 900, Confidence: 1.0,
+		Hops: 1, Hour: 8, IsPrimary: true,
+		SchedConnDepSecs: 30000, EarliestCatchSecs: 30360,
+		CreatedAt: now.Unix(), ExpiresAt: now.Unix() + 1,
+	}
+}
+
+// TestSweep_RealizedWait_OnTimeService is the direct fix for the 6-hour
+// run's failure mode: connecting trains running exactly on schedule must
+// VERIFY a correct wait prediction instead of falsifying it.
+func TestSweep_RealizedWait_OnTimeService(t *testing.T) {
+	f := newEvalFixture(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	// Missed connection el_1 at 30000; earliest catch 30360; next boardable
+	// on-time train el_2 at 30900 → realized wait 900, matching the
+	// prediction. No delay observations exist — absence means on time.
+	if err := f.store.Add(ctx, framedPrimary(now)); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.eval.sweepOnce(ctx, now.Add(30*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	avg, count, err := f.hist.GetAverageImpact(ctx, "A", "L", "S1", 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 || avg != 900 {
+		t.Fatalf("realized-wait history = (%v, %d), want (900, 1) — on-time service must verify a wait prediction", avg, count)
+	}
+}
+
+// TestSweep_RealizedWait_DelayedTrainRescues: the missed connection itself
+// running late enough to be caught shrinks the realized wait.
+func TestSweep_RealizedWait_DelayedTrainRescues(t *testing.T) {
+	f := newEvalFixture(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	// el_1 (scheduled 30000) is 400s late → realized 30400 >= earliest
+	// catch 30360 → the passenger boards it: wait = 400, not 900.
+	if err := f.mgr.ProcessEvent(ctx, &pb.DelayEvent{
+		AgencyId: "MTA", TripId: "el_1", RouteId: "L", StopId: "S1",
+		DelaySeconds: 400, ObservedAt: now.Unix(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.Add(ctx, framedPrimary(now)); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.eval.sweepOnce(ctx, now.Add(30*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	avg, count, err := f.hist.GetAverageImpact(ctx, "A", "L", "S1", 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 || avg != 400 {
+		t.Fatalf("rescue history = (%v, %d), want (400, 1) — a late connection the passenger catches shrinks the outcome", avg, count)
 	}
 }
