@@ -13,41 +13,60 @@ import (
 )
 
 const (
-	baseDwellSecs     = 30   // assumed base dwell time per stop (seconds)
-	dwellElasticity   = 0.3  // extra_dwell = base_dwell * load_pct * elasticity
-	loadIncreasePct   = 0.15 // fraction of riders affected by a broken transfer
-	confidenceDecay   = 0.7  // per-hop multiplier
-	minConfidence     = 0.2  // stop propagating below this
-	minDelayThreshold = 15   // stop propagating below this many seconds
-	maxDepth          = 5    // recursive propagation depth limit
+	// shrinkageK controls how quickly historical observations dominate a
+	// schedule-based estimate: weight = count / (count + shrinkageK).
+	shrinkageK = 10.0
+	// maxConnectingDelayAddSecs caps the connecting-delay addition to the
+	// wait estimate when no scheduled headway is known.
+	maxConnectingDelayAddSecs = 900
 )
 
 // PropagationEngine predicts cascading downstream delays when a transfer
-// breaks, using a priority-queue-driven walk of the temporal graph.
+// breaks, using a priority-queue-driven walk of the temporal graph
+// conditioned on live network state and locally observed outcomes.
 type PropagationEngine struct {
-	graph   *graph.TransitGraph
-	state   *state.DelayStateManager
-	history *HistoricalStore
-	logger  *slog.Logger
+	graph    *graph.TransitGraph
+	state    *state.DelayStateManager
+	history  *HistoricalStore
+	stopHist *StopImpactStore
+	agencyID string
+	cfg      Config
+	logger   *slog.Logger
 }
 
 // NewPropagationEngine creates an engine wired to the graph, state, and
-// historical stores.
+// historical stores. stopHist may be nil (per-stop blending disabled). A
+// zero-valued cfg gets defaults.
 func NewPropagationEngine(
 	g *graph.TransitGraph,
 	mgr *state.DelayStateManager,
 	hist *HistoricalStore,
+	stopHist *StopImpactStore,
+	agencyID string,
+	cfg Config,
 	logger *slog.Logger,
 ) *PropagationEngine {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &PropagationEngine{
-		graph:   g,
-		state:   mgr,
-		history: hist,
-		logger:  logger,
+		graph:    g,
+		state:    mgr,
+		history:  hist,
+		stopHist: stopHist,
+		agencyID: agencyID,
+		cfg:      cfg.WithDefaults(),
+		logger:   logger,
 	}
+}
+
+// walk carries the per-Propagate traversal state.
+type walk struct {
+	pq      *impactQueue
+	visited map[string]bool  // routeID:parentStationID
+	live    map[string]int32 // routeID:parentStationID → max active positive delay
+	tod     int              // seconds since midnight at detection time
+	hour    int
 }
 
 // Propagate walks downstream from a broken transfer and predicts cascading
@@ -55,7 +74,6 @@ func NewPropagationEngine(
 func (e *PropagationEngine) Propagate(ctx context.Context, impact *pb.TransferImpact) (*pb.PropagationResult, error) {
 	toRoute := impact.GetToRouteId()
 	stationID := impact.GetStationId()
-	sourceDelay := impact.GetSourceDelaySeconds()
 
 	// Determine direction from the next viable trip.
 	directionID := 0
@@ -65,74 +83,44 @@ func (e *PropagationEngine) Propagate(ctx context.Context, impact *pb.TransferIm
 		}
 	}
 
-	downstream := e.graph.GetDownstreamStops(toRoute, stationID, directionID)
-
 	result := &pb.PropagationResult{
 		SourceTripId:       impact.GetFromTripId(),
 		SourceStopId:       stationID,
-		SourceDelaySeconds: sourceDelay,
+		SourceDelaySeconds: impact.GetSourceDelaySeconds(),
 		ComputedAt:         time.Now().Unix(),
 	}
 
-	if len(downstream) == 0 {
-		return result, nil
+	tod := secsSinceMidnight(impact.GetDetectedAt())
+	w := &walk{
+		pq:      &impactQueue{},
+		visited: make(map[string]bool),
+		live:    e.snapshotLiveDelays(ctx),
+		tod:     tod,
+		hour:    tod / 3600 % 24,
 	}
+	heap.Init(w.pq)
 
 	// Check historical data for a better prediction.
-	hour := secsSinceMidnight(impact.GetDetectedAt()) / 3600 % 24
 	histAvg, histCount, _ := e.history.GetAverageImpact(
-		ctx, impact.GetFromRouteId(), toRoute, stationID, hour,
+		ctx, impact.GetFromRouteId(), toRoute, stationID, w.hour,
 	)
 
-	// Seed the priority queue with the first downstream stop.
-	initialDelay := e.estimateInitialDelay(impact, directionID, histAvg, histCount)
-	pq := &impactQueue{}
-	heap.Init(pq)
-	heap.Push(pq, &queueItem{
-		routeID:     toRoute,
-		stopID:      downstream[0].StopID,
-		delay:       initialDelay,
-		confidence:  1.0,
-		hops:        1,
-		impactType:  "dwell_increase",
-		directionID: directionID,
-	})
-
-	// Add remaining downstream stops with accumulated dwell increase.
-	accumulatedDelay := initialDelay
-	for i := 1; i < len(downstream); i++ {
-		extraDwell := float64(baseDwellSecs) * loadIncreasePct * dwellElasticity
-		accumulatedDelay += int32(math.Round(extraDwell))
-		conf := confidenceDecay * math.Pow(confidenceDecay, float64(i))
-		if conf < minConfidence || accumulatedDelay < minDelayThreshold {
-			break
-		}
-		heap.Push(pq, &queueItem{
-			routeID:     toRoute,
-			stopID:      downstream[i].StopID,
-			delay:       accumulatedDelay,
-			confidence:  conf,
-			hops:        1,
-			impactType:  "dwell_increase",
-			directionID: directionID,
-		})
-	}
+	connDelay := w.live[toRoute+":"+e.graph.ParentStationID(stationID)]
+	initialDelay := e.estimateInitialDelay(impact, directionID, connDelay, histAvg, histCount)
+	e.seedDownstream(ctx, w, toRoute, stationID, directionID, initialDelay, 1.0, 1, "dwell_increase")
 
 	// Process the queue (highest impact first).
-	visited := make(map[string]bool)
-	for pq.Len() > 0 {
-		item := heap.Pop(pq).(*queueItem)
-		key := item.routeID + ":" + item.stopID
-		if visited[key] {
+	for w.pq.Len() > 0 {
+		if len(result.Impacts) >= e.cfg.MaxImpacts {
+			break
+		}
+		item := heap.Pop(w.pq).(*queueItem)
+		parentID := e.graph.ParentStationID(item.stopID)
+		key := item.routeID + ":" + parentID
+		if w.visited[key] {
 			continue
 		}
-		visited[key] = true
-
-		parentID := e.graph.ParentStationID(item.stopID)
-		stopName := item.stopID
-		if s, ok := e.graph.Stops[parentID]; ok {
-			stopName = s.Name
-		}
+		w.visited[key] = true
 
 		result.Impacts = append(result.Impacts, &pb.DownstreamImpact{
 			RouteId:                  item.routeID,
@@ -143,13 +131,18 @@ func (e *PropagationEngine) Propagate(ctx context.Context, impact *pb.TransferIm
 			ImpactType:               item.impactType,
 		})
 
-		// Recursive propagation: check if this accumulated delay breaks
-		// further transfers at this stop.
-		if item.hops < maxDepth && item.delay >= minDelayThreshold {
-			e.propagateTransfers(ctx, pq, parentID, item.routeID, item.delay, item.confidence, item.hops, visited)
-		}
+		if item.hops < e.cfg.MaxDepth && item.delay >= e.cfg.MinDelayThreshold {
+			// Check if this accumulated delay breaks further transfers here.
+			e.propagateTransfers(w, parentID, item.routeID, item.delay, item.confidence, item.hops)
 
-		_ = stopName // used for potential debug logging
+			// A cascade onto a new route ripples down that route too.
+			if item.impactType == "cascade_transfer" {
+				if dir, ok := e.deriveDirection(item.routeID, parentID, w.tod); ok {
+					e.seedDownstream(ctx, w, item.routeID, parentID, dir,
+						item.delay, item.confidence, item.hops, "cascade_dwell")
+				}
+			}
+		}
 	}
 
 	e.logger.Debug("propagation complete",
@@ -160,26 +153,123 @@ func (e *PropagationEngine) Propagate(ctx context.Context, impact *pb.TransferIm
 	return result, nil
 }
 
+// snapshotLiveDelays captures the current active positive delays as
+// routeID:parentStationID → max delay, from a single scan. Degrades to an
+// empty map (schedule-only predictions) when state is unavailable.
+func (e *PropagationEngine) snapshotLiveDelays(ctx context.Context) map[string]int32 {
+	out := make(map[string]int32)
+	if e.state == nil {
+		return out
+	}
+	delays, err := e.state.GetAllActiveDelays(ctx, e.agencyID)
+	if err != nil {
+		e.logger.Warn("live delay snapshot", "err", err)
+		return out
+	}
+	for _, ds := range delays {
+		if ds.DelaySeconds <= 0 {
+			continue // only lateness changes whether a connection is catchable
+		}
+		key := ds.RouteID + ":" + e.graph.ParentStationID(ds.StopID)
+		if ds.DelaySeconds > out[key] {
+			out[key] = ds.DelaySeconds
+		}
+	}
+	return out
+}
+
+// seedDownstream enqueues the stops after stationID on routeID/direction,
+// accumulating dwell delay and decaying confidence per stop. Emitted delays
+// for stops past the first are blended with locally observed outcomes when
+// enough samples exist; the model accumulator itself stays pure so one
+// stop's history cannot distort later stops.
+func (e *PropagationEngine) seedDownstream(
+	ctx context.Context, w *walk,
+	routeID, stationID string, directionID int,
+	startDelay int32, baseConf float64, hops int, impactType string,
+) {
+	downstream := e.graph.GetDownstreamStops(routeID, stationID, directionID)
+	if len(downstream) == 0 {
+		return
+	}
+
+	heap.Push(w.pq, &queueItem{
+		routeID:     routeID,
+		stopID:      downstream[0].StopID,
+		delay:       startDelay,
+		confidence:  baseConf,
+		hops:        hops,
+		impactType:  impactType,
+		directionID: directionID,
+	})
+
+	accumulated := startDelay
+	for i := 1; i < len(downstream); i++ {
+		extraDwell := float64(e.cfg.BaseDwellSecs) * e.cfg.LoadIncreasePct * e.cfg.DwellElasticity
+		accumulated += int32(math.Round(extraDwell))
+		conf := baseConf * math.Pow(e.cfg.ConfidenceDecay, float64(i+1))
+		if conf < e.cfg.MinConfidence || accumulated < e.cfg.MinDelayThreshold {
+			break
+		}
+		heap.Push(w.pq, &queueItem{
+			routeID:     routeID,
+			stopID:      downstream[i].StopID,
+			delay:       e.blendPerStop(ctx, w, routeID, downstream[i].StopID, accumulated),
+			confidence:  conf,
+			hops:        hops,
+			impactType:  impactType,
+			directionID: directionID,
+		})
+	}
+}
+
+// blendPerStop shrinkage-blends the model's accumulated delay with observed
+// outcomes at this stop when enough samples exist.
+func (e *PropagationEngine) blendPerStop(ctx context.Context, w *walk, routeID, stopID string, modelDelay int32) int32 {
+	if e.stopHist == nil {
+		return modelDelay
+	}
+	stationID := e.graph.ParentStationID(stopID)
+	avg, n, err := e.stopHist.GetAverageStopImpact(ctx, routeID, stationID, w.hour)
+	if err != nil || n < e.cfg.PerStopMinCount {
+		return modelDelay
+	}
+	wgt := float64(n) / (float64(n) + shrinkageK)
+	return int32(math.Round(wgt*avg + (1-wgt)*float64(modelDelay)))
+}
+
+// deriveDirection picks the direction of the next scheduled departure on
+// routeID at stationID after tod — the next train to leave is the one that
+// inherits a cascade.
+func (e *PropagationEngine) deriveDirection(routeID, stationID string, tod int) (int, bool) {
+	deps := e.graph.GetNextDepartures(stationID, routeID, tod, 1)
+	if len(deps) == 0 {
+		return 0, false
+	}
+	d, ok := e.graph.TripDirection[deps[0].TripID]
+	return d, ok
+}
+
 // propagateTransfers checks if the accumulated delay at a stop breaks any
-// outbound transfers and, if so, adds the downstream stops of those
-// connecting routes to the priority queue.
+// outbound transfers and, if so, queues the connecting routes. A connecting
+// route that is already running late widens the effective margin — the late
+// train is easier to catch.
 func (e *PropagationEngine) propagateTransfers(
-	ctx context.Context,
-	pq *impactQueue,
+	w *walk,
 	stationID, sourceRoute string,
 	delay int32,
 	parentConf float64,
 	parentHops int,
-	visited map[string]bool,
 ) {
 	transfers := e.graph.GetTransfersFrom(stationID)
 	for _, xfer := range transfers {
+		destParent := e.graph.ParentStationID(xfer.ToStopID)
 		destRoutes := e.graph.GetRoutesAtStop(xfer.ToStopID)
 		for toRoute := range destRoutes {
 			if toRoute == sourceRoute {
 				continue
 			}
-			if visited[toRoute+":"+xfer.ToStopID] {
+			if w.visited[toRoute+":"+destParent] {
 				continue
 			}
 
@@ -187,22 +277,21 @@ func (e *PropagationEngine) propagateTransfers(
 			if minXfer <= 0 {
 				minXfer = 120
 			}
-			// Simplified check: if the accumulated delay exceeds the
-			// typical transfer margin, this connection is likely broken.
-			if int(delay) < minXfer {
+			connDelay := w.live[toRoute+":"+destParent]
+			if int(delay) < minXfer+int(connDelay) {
 				continue
 			}
 
-			newConf := parentConf * confidenceDecay
-			if newConf < minConfidence {
+			newConf := parentConf * e.cfg.ConfidenceDecay
+			if newConf < e.cfg.MinConfidence {
 				continue
 			}
-			newDelay := int32(float64(delay) * dwellElasticity)
-			if newDelay < minDelayThreshold {
+			newDelay := int32(float64(delay) * e.cfg.DwellElasticity)
+			if newDelay < e.cfg.MinDelayThreshold {
 				continue
 			}
 
-			heap.Push(pq, &queueItem{
+			heap.Push(w.pq, &queueItem{
 				routeID:    toRoute,
 				stopID:     xfer.ToStopID,
 				delay:      newDelay,
@@ -215,26 +304,48 @@ func (e *PropagationEngine) propagateTransfers(
 }
 
 // estimateInitialDelay computes the predicted additional delay on the first
-// downstream stop. The primary signal is schedule-based: the wait until the
-// next viable trip on the receiving route (from the detector), guarded by
-// half the scheduled headway in case the detector understated the wait. When
-// neither is available, fall back to the legacy load/dwell linear model.
-// Historical observations, when plentiful, are blended in at 60%.
-func (e *PropagationEngine) estimateInitialDelay(impact *pb.TransferImpact, directionID int, histAvg float64, histCount int) int32 {
-	scheduleEst := float64(impact.GetAdditionalWaitSeconds())
-	tod := secsSinceMidnight(impact.GetDetectedAt())
-	if hw, ok := e.graph.GetScheduledHeadway(impact.GetToRouteId(), directionID, impact.GetStationId(), tod); ok {
-		if half := hw / 2; half > scheduleEst {
-			scheduleEst = half
+// downstream stop. For transfers, the primary signal is schedule-based — the
+// wait until the next viable trip on the receiving route, guarded by half
+// the scheduled headway — plus the receiving route's current delay (capped
+// at one headway: beyond that the passenger catches the following train).
+// For self-propagation (from == to route) the train simply carries its own
+// delay. History, when plentiful, is shrinkage-blended in.
+func (e *PropagationEngine) estimateInitialDelay(
+	impact *pb.TransferImpact,
+	directionID int,
+	connectingDelay int32,
+	histAvg float64,
+	histCount int,
+) int32 {
+	var scheduleEst float64
+	if impact.GetFromRouteId() != "" && impact.GetFromRouteId() == impact.GetToRouteId() {
+		scheduleEst = float64(impact.GetSourceDelaySeconds())
+	} else {
+		scheduleEst = float64(impact.GetAdditionalWaitSeconds())
+		tod := secsSinceMidnight(impact.GetDetectedAt())
+		hw, hwOK := e.graph.GetScheduledHeadway(impact.GetToRouteId(), directionID, impact.GetStationId(), tod)
+		if hwOK {
+			if half := hw / 2; half > scheduleEst {
+				scheduleEst = half
+			}
+		}
+		if scheduleEst <= 0 {
+			scheduleEst = float64(impact.GetSourceDelaySeconds()) * e.cfg.LoadIncreasePct * e.cfg.DwellElasticity
+		}
+		if connectingDelay > 0 {
+			add := float64(connectingDelay)
+			if hwOK {
+				if add > hw {
+					add = hw
+				}
+			} else if add > maxConnectingDelayAddSecs {
+				add = maxConnectingDelayAddSecs
+			}
+			scheduleEst += add
 		}
 	}
-	if scheduleEst <= 0 {
-		scheduleEst = float64(impact.GetSourceDelaySeconds()) * loadIncreasePct * dwellElasticity
-	}
-	if histCount >= 5 {
-		return int32(math.Round(0.6*histAvg + 0.4*scheduleEst))
-	}
-	return int32(math.Round(scheduleEst))
+	wgt := float64(histCount) / (float64(histCount) + shrinkageK)
+	return int32(math.Round(wgt*histAvg + (1-wgt)*scheduleEst))
 }
 
 // secsSinceMidnight converts a Unix timestamp to seconds since midnight in

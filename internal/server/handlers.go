@@ -195,12 +195,17 @@ func (s *TransitService) PredictImpact(ctx context.Context, req *pb.PredictImpac
 	// Determine the route for this trip.
 	routeID := s.graph.TripRoute[tripID]
 
-	// Build a synthetic TransferImpact to feed the engine.
+	// Build a synthetic self-propagation impact: the delayed train carries
+	// its delay down its own line. NextViableTripId lets the engine derive
+	// the direction; ToRouteId must be set or propagation matches nothing.
 	impact := &pb.TransferImpact{
-		FromTripId:          tripID,
-		FromRouteId:         routeID,
-		StationId:           parentID,
-		SourceDelaySeconds:  delay.DelaySeconds,
+		FromTripId:         tripID,
+		FromRouteId:        routeID,
+		ToRouteId:          routeID,
+		StationId:          parentID,
+		SourceDelaySeconds: delay.DelaySeconds,
+		NextViableTripId:   tripID,
+		DetectedAt:         syntheticDetectedAt(delay.ObservedAt),
 	}
 
 	result, err := s.engine.Propagate(ctx, impact)
@@ -238,8 +243,11 @@ func (s *TransitService) GetBlastRadius(ctx context.Context, req *pb.BlastRadius
 			impact := &pb.TransferImpact{
 				FromTripId:         d.TripID,
 				FromRouteId:        routeID,
+				ToRouteId:          routeID,
 				StationId:          stationID,
 				SourceDelaySeconds: d.DelaySeconds,
+				NextViableTripId:   d.TripID,
+				DetectedAt:         syntheticDetectedAt(d.ObservedAt),
 			}
 			result, err := s.engine.Propagate(ctx, impact)
 			if err != nil {
@@ -281,6 +289,15 @@ func (s *TransitService) GetTransferReliability(ctx context.Context, req *pb.Tra
 		})
 	}
 	return resp, nil
+}
+
+// syntheticDetectedAt uses the observation time of the delay backing a
+// synthetic impact, falling back to now.
+func syntheticDetectedAt(observedAt int64) int64 {
+	if observedAt > 0 {
+		return observedAt
+	}
+	return time.Now().Unix()
 }
 
 func matchesFilter(impact *pb.TransferImpact, routes, stations map[string]bool) bool {

@@ -14,10 +14,14 @@ const (
 	historyRetentionSecs = historyRetentionDays * 24 * 3600
 )
 
-// observation is the JSON payload stored in each sorted-set member.
+// observation is the JSON payload stored in each sorted-set member. At
+// (nanoseconds) makes each member unique — sorted-set members dedupe, so
+// identical observations would otherwise collapse into one and corrupt
+// sample counts.
 type observation struct {
-	SourceDelay      int `json:"source_delay"`
-	DownstreamImpact int `json:"downstream_impact"`
+	SourceDelay      int   `json:"source_delay"`
+	DownstreamImpact int   `json:"downstream_impact"`
+	At               int64 `json:"at,omitempty"`
 }
 
 // HistoricalStore records and queries downstream-impact observations for
@@ -50,6 +54,7 @@ func (h *HistoricalStore) RecordObservation(
 	data, err := json.Marshal(observation{
 		SourceDelay:      sourceDelay,
 		DownstreamImpact: downstreamImpact,
+		At:               time.Now().UnixNano(),
 	})
 	if err != nil {
 		return err
