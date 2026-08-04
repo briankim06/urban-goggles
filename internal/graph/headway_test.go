@@ -114,3 +114,30 @@ func TestHeadway_ChildStopNormalized(t *testing.T) {
 		t.Fatalf("child stop lookup: got (%v, %v), want (600, true)", h, ok)
 	}
 }
+
+func TestHeadway_OvernightHourFallback(t *testing.T) {
+	g := &TransitGraph{
+		Stops:         map[string]*Stop{"S1": {ID: "S1", LocationType: 1}},
+		TripRoute:     map[string]string{"a": "L", "b": "L", "c": "L"},
+		TripDirection: map[string]int{"a": 0, "b": 0, "c": 0},
+		StopTimesByStop: map[string][]*ScheduledStopTime{
+			"S1": {
+				{TripID: "a", StopID: "S1", DepartureSecs: 25 * 3600},
+				{TripID: "b", StopID: "S1", DepartureSecs: 25*3600 + 1200},
+				{TripID: "c", StopID: "S1", DepartureSecs: 25*3600 + 2400},
+			},
+		},
+	}
+	g.BuildHeadwayIndex()
+
+	// A wall-clock 01:05 query (hour 1) must find the service bucketed at
+	// GTFS hour 25.
+	h, ok := g.GetScheduledHeadway("L", 0, "S1", 1*3600+300)
+	if !ok || h != 1200 {
+		t.Fatalf("overnight fallback: got (%v, %v), want (1200, true)", h, ok)
+	}
+	// Hours >= 4 must not fall back.
+	if _, ok := g.GetScheduledHeadway("L", 0, "S1", 5*3600); ok {
+		t.Error("daytime hour must not hit overnight buckets")
+	}
+}

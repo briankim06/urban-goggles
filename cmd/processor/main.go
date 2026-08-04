@@ -132,14 +132,14 @@ func main() {
 
 	var catchUp atomic.Bool
 	handler := &consumerHandler{
-		mgr:       mgr,
-		detector:  detector,
-		engine:    propEngine,
-		predPub:   predPub,
-		eval:      evaluator,
-		graph:     g,
-		catchUp:   &catchUp,
-		logger:    logger,
+		mgr:      mgr,
+		detector: detector,
+		engine:   propEngine,
+		predPub:  predPub,
+		eval:     evaluator,
+		graph:    g,
+		catchUp:  &catchUp,
+		logger:   logger,
 	}
 
 	// Stats reporter and lag monitor.
@@ -216,8 +216,17 @@ func (h *consumerHandler) ConsumeClaim(sess sarama.ConsumerGroupSession, claim s
 		// static schedule before state, evaluation, and detection see it.
 		enrichEvent(h.graph, &ev)
 
-		if err := h.mgr.ProcessEvent(sess.Context(), &ev); err != nil {
-			h.logger.Error("process event", "err", err, "trip", ev.GetTripId())
+		// A ProcessEvent failure means Redis is unreachable. Retry briefly,
+		// then end the claim WITHOUT marking this message — the consume loop
+		// re-enters and Kafka redelivers from the last committed offset, so
+		// an outage stalls consumption instead of silently dropping events.
+		if err := withRetry(sess.Context(), 3, 200*time.Millisecond, func() error {
+			return h.mgr.ProcessEvent(sess.Context(), &ev)
+		}); err != nil {
+			metrics.ProcessorEventFailures.Inc()
+			h.logger.Error("process event failed after retries; restarting claim",
+				"err", err, "trip", ev.GetTripId())
+			return err
 		}
 
 		// Match this event against pending predictions. Runs even in
@@ -271,6 +280,28 @@ func (h *consumerHandler) runPropagation(ctx context.Context, impact *pb.Transfe
 	if err := h.predPub.Publish(ctx, result); err != nil {
 		h.logger.Error("publish prediction", "err", err)
 	}
+}
+
+// withRetry runs fn up to attempts times with doubling backoff, aborting
+// early when ctx is done. Returns the last error when attempts exhaust.
+func withRetry(ctx context.Context, attempts int, base time.Duration, fn func() error) error {
+	var err error
+	delay := base
+	for i := 0; i < attempts; i++ {
+		if err = fn(); err == nil {
+			return nil
+		}
+		if i == attempts-1 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(delay):
+			delay *= 2
+		}
+	}
+	return err
 }
 
 // monitorLag periodically checks the accumulated lag from consumer claims

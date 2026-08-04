@@ -67,6 +67,13 @@ var (
 		},
 	)
 
+	ProcessorEventFailures = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "processor_event_failures_total",
+			Help: "Events that exhausted processing retries and forced a consumer restart.",
+		},
+	)
+
 	ProcessorEnrichment = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "processor_enrichment_total",
@@ -186,6 +193,7 @@ func init() {
 		ProcessorActiveDelays,
 		ProcessorBrokenTransfers,
 		ProcessorPropagationFanOut,
+		ProcessorEventFailures,
 		ProcessorEnrichment,
 		// Server
 		ServerGRPCRequests,

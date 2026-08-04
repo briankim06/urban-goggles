@@ -93,14 +93,17 @@ func (d *TransferDetector) EvaluateDelay(ctx context.Context, ev *pb.DelayEvent)
 			}
 
 			// Find the next departure on toRoute from destStation after the
-			// original scheduled arrival of the delayed trip.
-			deps := d.graph.GetNextDepartures(destStation, toRoute, scheduledArrSecs, 3)
+			// original scheduled arrival of the delayed trip. Early-morning
+			// arrivals may connect to the previous service day's 24:xx+
+			// trips, so margins are computed against the effective
+			// time-of-day the lookup used.
+			deps, effTod := d.graph.NextDeparturesAfter(destStation, toRoute, scheduledArrSecs, 3)
 			if len(deps) == 0 {
 				continue // no service on connecting route
 			}
 			nextDep := deps[0]
 
-			originalMargin := int32(nextDep.DepartureSecs - scheduledArrSecs)
+			originalMargin := int32(nextDep.DepartureSecs - effTod)
 			if originalMargin < 0 {
 				continue // departure was before arrival — not a real connection
 			}
@@ -127,7 +130,9 @@ func (d *TransferDetector) EvaluateDelay(ctx context.Context, ev *pb.DelayEvent)
 			var nextViableTripID string
 			var additionalWait int32
 			if level == pb.TransferImpact_BROKEN {
-				predictedArrSecs := scheduledArrSecs + int(ev.GetDelaySeconds())
+				// earliestCatch is already in the effective frame, so the
+				// plain lookup is correct even past 86400.
+				predictedArrSecs := effTod + int(ev.GetDelaySeconds())
 				earliestCatch := predictedArrSecs + minXferTime
 				viableDeps := d.graph.GetNextDepartures(destStation, toRoute, earliestCatch, 1)
 				if len(viableDeps) > 0 {

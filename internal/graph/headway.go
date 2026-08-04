@@ -75,6 +75,11 @@ func (g *TransitGraph) GetScheduledHeadway(routeID string, directionID int, stop
 		return 0, false
 	}
 	h, ok := g.headways[headwayKey(routeID, directionID, stationID, hour)]
+	if !ok && hour < 4 {
+		// Early-morning service is scheduled as GTFS 24:xx+ times and
+		// bucketed at hours 24-27; wall-clock callers only produce 0-23.
+		h, ok = g.headways[headwayKey(routeID, directionID, stationID, hour+24)]
+	}
 	return h, ok
 }
 

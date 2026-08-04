@@ -29,11 +29,11 @@ type Trip struct {
 // ScheduledStopTime is one row from stop_times.txt with the time converted
 // to seconds since midnight (may exceed 86400 for past-midnight trips).
 type ScheduledStopTime struct {
-	TripID       string
-	StopID       string
-	ArrivalSecs  int // seconds since midnight
+	TripID        string
+	StopID        string
+	ArrivalSecs   int // seconds since midnight
 	DepartureSecs int
-	StopSequence int
+	StopSequence  int
 }
 
 // Transfer represents one row from transfers.txt.
