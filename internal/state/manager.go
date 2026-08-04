@@ -163,9 +163,15 @@ func (m *DelayStateManager) ProcessEvent(ctx context.Context, ev *transit.DelayE
 	})
 }
 
-// GetDelay reads the current delay state for a specific trip+stop.
+// GetDelay reads the current delay state for a specific trip+stop. It
+// returns (nil, nil) when no state exists — absence is a normal condition,
+// not an error.
 func (m *DelayStateManager) GetDelay(ctx context.Context, agencyID, tripID, stopID string) (*DelayState, error) {
-	return m.getState(ctx, delayKey(agencyID, tripID, stopID))
+	ds, err := m.getState(ctx, delayKey(agencyID, tripID, stopID))
+	if err == redis.Nil {
+		return nil, nil
+	}
+	return ds, err
 }
 
 // GetRouteDelays scans Redis for all delay keys belonging to a route. It uses

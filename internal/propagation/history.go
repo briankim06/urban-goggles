@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -119,10 +121,15 @@ func (h *HistoricalStore) GetTransferStats(
 	iter := h.rdb.Scan(ctx, 0, pattern, 100).Iterator()
 	for iter.Next(ctx) {
 		key := iter.Val()
-		// Parse fromRoute:toRoute from key.
-		var from, to, station string
-		var hour int
-		if _, err := fmt.Sscanf(key, "history:%[^:]:%[^:]:%[^:]:%d", &from, &to, &station, &hour); err != nil {
+		// Key layout: history:{from}:{to}:{station}:{hour}. Route and
+		// station IDs contain no ':' (the key format depends on it). Note
+		// fmt.Sscanf cannot parse this — Go does not support %[^:] scansets.
+		parts := strings.SplitN(key, ":", 5)
+		if len(parts) != 5 {
+			continue
+		}
+		from, to := parts[1], parts[2]
+		if _, err := strconv.Atoi(parts[4]); err != nil {
 			continue
 		}
 

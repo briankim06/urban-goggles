@@ -182,13 +182,13 @@ func TestProcessEvent_TripCancelledClearsAllTripKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := m.GetDelay(ctx, "test", "t1", "s1"); err == nil {
+	if ds, _ := m.GetDelay(ctx, "test", "t1", "s1"); ds != nil {
 		t.Error("t1/s1 should be cleared")
 	}
-	if _, err := m.GetDelay(ctx, "test", "t1", "s2"); err == nil {
+	if ds, _ := m.GetDelay(ctx, "test", "t1", "s2"); ds != nil {
 		t.Error("t1/s2 should be cleared")
 	}
-	if ds, err := m.GetDelay(ctx, "test", "t2", "s1"); err != nil || ds.DelaySeconds != 240 {
+	if ds, err := m.GetDelay(ctx, "test", "t2", "s1"); err != nil || ds == nil || ds.DelaySeconds != 240 {
 		t.Errorf("t2/s1 must be untouched: (%+v, %v)", ds, err)
 	}
 	// The cancellation itself must not create a key.
@@ -215,10 +215,26 @@ func TestProcessEvent_SkipStopClearsSingleKey(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := m.GetDelay(ctx, "test", "t1", "s1"); err == nil {
+	if ds, _ := m.GetDelay(ctx, "test", "t1", "s1"); ds != nil {
 		t.Error("t1/s1 should be cleared")
 	}
-	if ds, err := m.GetDelay(ctx, "test", "t1", "s2"); err != nil || ds.DelaySeconds != 180 {
+	if ds, err := m.GetDelay(ctx, "test", "t1", "s2"); err != nil || ds == nil || ds.DelaySeconds != 180 {
 		t.Errorf("t1/s2 must be untouched: (%+v, %v)", ds, err)
+	}
+}
+
+func TestGetDelay_MissReturnsNil(t *testing.T) {
+	rdb := skipIfNoRedis(t)
+	defer rdb.Close()
+	ctx := context.Background()
+	rdb.FlushDB(ctx)
+
+	m := NewDelayStateManager(rdb, nil, nil)
+	ds, err := m.GetDelay(ctx, "test", "nope", "nowhere")
+	if err != nil {
+		t.Fatalf("miss must not error, got %v", err)
+	}
+	if ds != nil {
+		t.Fatalf("miss must return nil state, got %+v", ds)
 	}
 }

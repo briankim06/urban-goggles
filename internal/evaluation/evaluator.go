@@ -140,6 +140,7 @@ func (e *Evaluator) TrackPrediction(ctx context.Context, src *pb.TransferImpact,
 			FromRoute:       src.GetFromRouteId(),
 			RouteID:         imp.GetRouteId(),
 			StationID:       imp.GetStopId(), // engine records parent station IDs
+			SourceStation:   e.graph.ParentStationID(src.GetStationId()),
 			Direction:       direction,
 			SourceDelaySecs: src.GetSourceDelaySeconds(),
 			PredictedSecs:   imp.GetPredictedAdditionalDelay(),
@@ -279,8 +280,15 @@ func (e *Evaluator) sweepOnce(ctx context.Context, now time.Time) error {
 		metrics.EvalPredictionsByConfidence.WithLabelValues(ConfidenceBucket(p.Confidence), outcome).Inc()
 
 		if p.IsPrimary {
+			// History is keyed by the transfer station — the same key the
+			// engine reads. Fall back to the impacted stop for pendings
+			// written before SourceStation existed.
+			station := p.SourceStation
+			if station == "" {
+				station = p.StationID
+			}
 			if err := e.history.RecordObservation(ctx,
-				p.FromRoute, p.RouteID, p.StationID, p.Hour,
+				p.FromRoute, p.RouteID, station, p.Hour,
 				int(p.SourceDelaySecs), int(p.ObservedMax),
 			); err != nil {
 				e.logger.Warn("record observation", "err", err, "id", p.ID)
