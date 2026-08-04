@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/IBM/sarama"
@@ -28,7 +29,7 @@ func main() {
 	cfg.Consumer.Return.Errors = true
 	cfg.Consumer.Offsets.Initial = sarama.OffsetNewest
 
-	client, err := sarama.NewConsumer([]string{*brokers}, cfg)
+	client, err := sarama.NewConsumer(strings.Split(*brokers, ","), cfg)
 	if err != nil {
 		logger.Error("new consumer", "err", err)
 		os.Exit(1)
@@ -56,6 +57,11 @@ func main() {
 				select {
 				case <-ctx.Done():
 					return
+				case err := <-pc.Errors():
+					// Drained so sarama's blocking send can't wedge us.
+					if err != nil {
+						logger.Warn("partition consumer error", "err", err)
+					}
 				case msg := <-pc.Messages():
 					if msg == nil {
 						return

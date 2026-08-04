@@ -2,8 +2,10 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/IBM/sarama"
 	pb "github.com/briankim06/urban-goggles/proto/transit"
@@ -62,9 +64,38 @@ func (b *AlertBroker) Publish(impact *pb.TransferImpact) {
 	}
 }
 
+const (
+	alertRetryBase = 5 * time.Second
+	alertRetryMax  = 60 * time.Second
+)
+
 // RunKafkaConsumer reads from the transfer-impacts topic and publishes each
-// event to all subscribers. Blocks until ctx is cancelled.
+// event to all subscribers, reconnecting with backoff on failure so a
+// transient Kafka outage (or Kafka not being up yet at boot) does not kill
+// the alert stream for the process lifetime. Blocks until ctx is cancelled.
 func (b *AlertBroker) RunKafkaConsumer(ctx context.Context, brokers []string, topic string) error {
+	backoff := alertRetryBase
+	for {
+		err := b.consumeOnce(ctx, brokers, topic)
+		if ctx.Err() != nil {
+			return nil
+		}
+		b.logger.Warn("alert consumer disconnected; retrying", "err", err, "backoff", backoff)
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(backoff):
+		}
+		if backoff *= 2; backoff > alertRetryMax {
+			backoff = alertRetryMax
+		}
+	}
+}
+
+// consumeOnce runs one consumer session over all current partitions.
+// Partitions added while the session is healthy are only picked up after the
+// next reconnect — accepted for a fixed-partition dev topology.
+func (b *AlertBroker) consumeOnce(ctx context.Context, brokers []string, topic string) error {
 	cfg := sarama.NewConfig()
 	cfg.Consumer.Return.Errors = true
 	cfg.Consumer.Offsets.Initial = sarama.OffsetNewest
@@ -81,12 +112,14 @@ func (b *AlertBroker) RunKafkaConsumer(ctx context.Context, brokers []string, to
 	}
 
 	var wg sync.WaitGroup
+	started := 0
 	for _, p := range partitions {
 		pc, err := client.ConsumePartition(topic, p, sarama.OffsetNewest)
 		if err != nil {
 			b.logger.Warn("consume partition", "partition", p, "err", err)
 			continue
 		}
+		started++
 		wg.Add(1)
 		go func(pc sarama.PartitionConsumer) {
 			defer wg.Done()
@@ -95,6 +128,12 @@ func (b *AlertBroker) RunKafkaConsumer(ctx context.Context, brokers []string, to
 				select {
 				case <-ctx.Done():
 					return
+				case err := <-pc.Errors():
+					// Must be drained: sarama's send into this channel
+					// blocks once its buffer fills, wedging the consumer.
+					if err != nil {
+						b.logger.Warn("partition consumer error", "err", err)
+					}
 				case msg := <-pc.Messages():
 					if msg == nil {
 						return
@@ -108,6 +147,9 @@ func (b *AlertBroker) RunKafkaConsumer(ctx context.Context, brokers []string, to
 				}
 			}
 		}(pc)
+	}
+	if started == 0 {
+		return fmt.Errorf("no partitions of %s could be consumed", topic)
 	}
 
 	<-ctx.Done()

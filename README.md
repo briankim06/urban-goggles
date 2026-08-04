@@ -75,6 +75,13 @@ make run-processor   # Kafka → state/transfer/propagation → Redis
 make run-server      # gRPC API on :50051
 ```
 
+> **Timezone & service day**: all time-of-day math (schedule matching,
+> headways, transfer margins) uses the process-local timezone, which must
+> match the agency's. The `make run-*` targets set `TZ=America/New_York`
+> (override with `make run-server TZ=...`). The schedule graph is built once
+> for the boot day's service calendar, so long-running processes should be
+> restarted daily.
+
 ## Makefile Targets
 
 | Target | Description |

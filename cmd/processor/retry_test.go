@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 )
@@ -52,5 +53,22 @@ func TestWithRetry_CancelledContextAborts(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Errorf("calls = %d, want 1 (no waiting on dead context)", calls)
+	}
+}
+
+func TestSumLags(t *testing.T) {
+	var m sync.Map
+	if got := sumLags(&m); got != 0 {
+		t.Errorf("empty map sum = %d, want 0", got)
+	}
+	m.Store("delay-events/0", int64(100))
+	m.Store("delay-events/1", int64(0))
+	m.Store("delay-events/2", int64(50000))
+	if got := sumLags(&m); got != 50100 {
+		t.Errorf("sum = %d, want 50100 (one caught-up partition must not mask others)", got)
+	}
+	m.Delete("delay-events/2")
+	if got := sumLags(&m); got != 100 {
+		t.Errorf("after delete sum = %d, want 100", got)
 	}
 }

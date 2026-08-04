@@ -39,6 +39,10 @@ const (
 	// Backpressure thresholds.
 	catchUpEnterLag = 1000 // enter catch-up mode when consumer lag exceeds this
 	catchUpExitLag  = 100  // exit catch-up mode when lag drops below this
+
+	// maxConcurrentPropagations bounds the propagation goroutines an event
+	// storm can spawn; excess broken transfers are shed (and counted).
+	maxConcurrentPropagations = 32
 )
 
 func main() {
@@ -127,6 +131,16 @@ func main() {
 	}
 	defer client.Close()
 
+	// Drain consumer-group errors: with Return.Errors=true an undrained
+	// channel silently drops them. Deliberately NOT in the WaitGroup — the
+	// channel closes only at the deferred client.Close(), which runs after
+	// wg.Wait(); joining the group would deadlock shutdown.
+	go func() {
+		for err := range client.Errors() {
+			logger.Warn("kafka consumer error", "err", err)
+		}
+	}()
+
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
@@ -140,6 +154,7 @@ func main() {
 		graph:    g,
 		catchUp:  &catchUp,
 		logger:   logger,
+		propSem:  make(chan struct{}, maxConcurrentPropagations),
 	}
 
 	// Stats reporter and lag monitor.
@@ -174,6 +189,8 @@ func main() {
 	}
 	logger.Info("shutdown signal received")
 	wg.Wait()
+	// Let in-flight propagation goroutines finish writing predictions.
+	handler.propWG.Wait()
 }
 
 // consumerHandler implements sarama.ConsumerGroupHandler.
@@ -186,6 +203,9 @@ type consumerHandler struct {
 	graph    *graph.TransitGraph
 	catchUp  *atomic.Bool
 	logger   *slog.Logger
+
+	propSem chan struct{} // bounds concurrent propagation goroutines
+	propWG  sync.WaitGroup
 }
 
 func (*consumerHandler) Setup(_ sarama.ConsumerGroupSession) error   { return nil }
@@ -194,16 +214,24 @@ func (*consumerHandler) Cleanup(_ sarama.ConsumerGroupSession) error { return ni
 func (h *consumerHandler) ConsumeClaim(sess sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
 	partition := strconv.Itoa(int(claim.Partition()))
 	topic := claim.Topic()
+	lagKey := topic + "/" + partition
+	defer func() {
+		// Rebalanced-away partitions must not linger in the lag sum or as
+		// stale gauge series.
+		partitionLags.Delete(lagKey)
+		metrics.KafkaConsumerLag.DeleteLabelValues(topic, partition)
+	}()
 	for msg := range claim.Messages() {
 		start := time.Now()
 
-		// Track consumer lag from high-water mark.
-		lag := claim.HighWaterMarkOffset() - msg.Offset
+		// Track consumer lag from the high-water mark; the message in hand
+		// doesn't count, so a caught-up consumer reports 0.
+		lag := claim.HighWaterMarkOffset() - msg.Offset - 1
 		if lag < 0 {
 			lag = 0
 		}
 		metrics.KafkaConsumerLag.WithLabelValues(topic, partition).Set(float64(lag))
-		totalConsumerLag.Store(lag)
+		partitionLags.Store(lagKey, lag)
 
 		var ev pb.DelayEvent
 		if err := proto.Unmarshal(msg.Value, &ev); err != nil {
@@ -247,7 +275,18 @@ func (h *consumerHandler) ConsumeClaim(sess sarama.ConsumerGroupSession, claim s
 			for _, impact := range impacts {
 				if impact.GetLevel() == pb.TransferImpact_BROKEN {
 					metrics.ProcessorBrokenTransfers.Inc()
-					go h.runPropagation(sess.Context(), impact)
+					// Acquire-or-shed: blocking here would stall consumption
+					// during exactly the storms that produce the load.
+					select {
+					case h.propSem <- struct{}{}:
+						h.propWG.Add(1)
+						go func(imp *pb.TransferImpact) {
+							defer func() { <-h.propSem; h.propWG.Done() }()
+							h.runPropagation(sess.Context(), imp)
+						}(impact)
+					default:
+						metrics.ProcessorPropagationsShed.Inc()
+					}
 				}
 			}
 		}
@@ -315,10 +354,9 @@ func monitorLag(ctx context.Context, logger *slog.Logger, _ sarama.ConsumerGroup
 			return
 		case <-t.C:
 			// Lag is tracked per-partition inside ConsumeClaim via
-			// HighWaterMarkOffset. The total is accumulated in
-			// totalConsumerLag (set by ConsumeClaim). We read it here
-			// to control backpressure.
-			lag := totalConsumerLag.Load()
+			// HighWaterMarkOffset; sum across partitions so one caught-up
+			// partition cannot mask another that is far behind.
+			lag := sumLags(&partitionLags)
 			wasCatchUp := catchUp.Load()
 			if lag > catchUpEnterLag && !wasCatchUp {
 				catchUp.Store(true)
@@ -331,8 +369,19 @@ func monitorLag(ctx context.Context, logger *slog.Logger, _ sarama.ConsumerGroup
 	}
 }
 
-// totalConsumerLag is updated by ConsumeClaim with the sum of per-partition lag.
-var totalConsumerLag atomic.Int64
+// partitionLags holds each partition's latest observed lag, keyed
+// "topic/partition"; entries are removed when a claim ends.
+var partitionLags sync.Map
+
+// sumLags totals the per-partition lag map.
+func sumLags(m *sync.Map) int64 {
+	var total int64
+	m.Range(func(_, v any) bool {
+		total += v.(int64)
+		return true
+	})
+	return total
+}
 
 func reportStats(ctx context.Context, logger *slog.Logger, mgr *state.DelayStateManager, agencyID string) {
 	t := time.NewTicker(30 * time.Second)

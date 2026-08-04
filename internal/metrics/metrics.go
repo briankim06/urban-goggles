@@ -67,6 +67,13 @@ var (
 		},
 	)
 
+	ProcessorPropagationsShed = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "processor_propagations_shed_total",
+			Help: "Broken transfers whose propagation was shed at the concurrency limit.",
+		},
+	)
+
 	ProcessorEventFailures = prometheus.NewCounter(
 		prometheus.CounterOpts{
 			Name: "processor_event_failures_total",
@@ -193,6 +200,7 @@ func init() {
 		ProcessorActiveDelays,
 		ProcessorBrokenTransfers,
 		ProcessorPropagationFanOut,
+		ProcessorPropagationsShed,
 		ProcessorEventFailures,
 		ProcessorEnrichment,
 		// Server
