@@ -38,12 +38,14 @@ func buildPropGraph() *graph.TransitGraph {
 		"trip_L1": "L",
 		"trip_L2": "L",
 		"trip_G1": "G",
+		"trip_G2": "G",
 	}
 	tripDir := map[string]int{
 		"trip_A1": 0,
 		"trip_L1": 0,
 		"trip_L2": 0,
 		"trip_G1": 0,
+		"trip_G2": 0,
 	}
 	// Route L stops: S1 (seq 1) → S2 (seq 2) → S3 (seq 3) → S4 (seq 4)
 	// Route G stops: S3G (seq 1) → S5 (seq 2)
@@ -60,16 +62,23 @@ func buildPropGraph() *graph.TransitGraph {
 		},
 	}
 	// A second L trip 600s behind trip_L1 gives route L a computable
-	// scheduled headway (600s) at S1 during hour 8.
+	// scheduled headway (600s) at S1 during hour 8; a second G trip 1800s
+	// behind trip_G1 does the same for G at S3 and lets deriveDirection find
+	// a departure after 08:30.
 	tripL2S1 := &graph.ScheduledStopTime{TripID: "trip_L2", StopID: "S1", StopSequence: 1, ArrivalSecs: 29400, DepartureSecs: 29400}
 	stopTimesByTrip["trip_L2"] = []*graph.ScheduledStopTime{tripL2S1}
+	stopTimesByTrip["trip_G2"] = []*graph.ScheduledStopTime{
+		{TripID: "trip_G2", StopID: "S3G", StopSequence: 1, ArrivalSecs: 30900, DepartureSecs: 30900},
+		{TripID: "trip_G2", StopID: "S5", StopSequence: 2, ArrivalSecs: 31020, DepartureSecs: 31020},
+	}
+	// Keyed by parent station and sorted by departure time, as BuildGraph
+	// produces (G's platform S3G folds into parent S3).
 	stopTimesByStop := map[string][]*graph.ScheduledStopTime{
-		"S1":  {stopTimesByTrip["trip_L1"][0], tripL2S1},
-		"S2":  stopTimesByTrip["trip_L1"][1:2],
-		"S3":  stopTimesByTrip["trip_L1"][2:3],
-		"S4":  stopTimesByTrip["trip_L1"][3:4],
-		"S3G": stopTimesByTrip["trip_G1"][:1],
-		"S5":  stopTimesByTrip["trip_G1"][1:2],
+		"S1": {stopTimesByTrip["trip_L1"][0], tripL2S1},
+		"S2": stopTimesByTrip["trip_L1"][1:2],
+		"S3": {stopTimesByTrip["trip_L1"][2], stopTimesByTrip["trip_G1"][0], stopTimesByTrip["trip_G2"][0]},
+		"S4": stopTimesByTrip["trip_L1"][3:4],
+		"S5": {stopTimesByTrip["trip_G1"][1], stopTimesByTrip["trip_G2"][1]},
 	}
 	transfers := map[string][]*graph.Transfer{
 		"S1": {
@@ -128,7 +137,7 @@ func TestPropagate_DownstreamStops(t *testing.T) {
 	g := buildPropGraph()
 	mgr := state.NewDelayStateManager(rdb, g, nil)
 	hist := NewHistoricalStore(rdb)
-	engine := NewPropagationEngine(g, mgr, hist, nil)
+	engine := NewPropagationEngine(g, mgr, hist, nil, "MTA", Config{}, nil)
 
 	impact := &pb.TransferImpact{
 		FromTripId:         "trip_A1",
@@ -148,16 +157,16 @@ func TestPropagate_DownstreamStops(t *testing.T) {
 		t.Fatal("expected downstream impacts, got none")
 	}
 
-	// Impacts land on route L directly, plus a possible cascade onto G via
-	// the S3 transfer now that the initial delay is headway-based.
+	// Impacts land on route L directly, plus a cascade onto G via the S3
+	// transfer — the transfer station itself and G's downstream stops.
 	sawL := false
 	for _, imp := range result.GetImpacts() {
 		switch imp.GetRouteId() {
 		case "L":
 			sawL = true
 		case "G":
-			if imp.GetImpactType() != "cascade_transfer" {
-				t.Errorf("G impact should be cascade_transfer, got %s", imp.GetImpactType())
+			if it := imp.GetImpactType(); it != "cascade_transfer" && it != "cascade_dwell" {
+				t.Errorf("G impact should be cascade_transfer or cascade_dwell, got %s", it)
 			}
 		default:
 			t.Errorf("unexpected route %s", imp.GetRouteId())
@@ -190,7 +199,7 @@ func TestPropagate_ConfidenceDecays(t *testing.T) {
 	g := buildPropGraph()
 	mgr := state.NewDelayStateManager(rdb, g, nil)
 	hist := NewHistoricalStore(rdb)
-	engine := NewPropagationEngine(g, mgr, hist, nil)
+	engine := NewPropagationEngine(g, mgr, hist, nil, "MTA", Config{}, nil)
 
 	impact := &pb.TransferImpact{
 		FromTripId:         "trip_A1",
@@ -235,7 +244,7 @@ func TestPropagate_SmallDelay_NoImpacts(t *testing.T) {
 	g := buildPropGraph()
 	mgr := state.NewDelayStateManager(rdb, g, nil)
 	hist := NewHistoricalStore(rdb)
-	engine := NewPropagationEngine(g, mgr, hist, nil)
+	engine := NewPropagationEngine(g, mgr, hist, nil, "MTA", Config{}, nil)
 
 	// Very small delay, no next-viable-wait, and an hour with no scheduled
 	// departures (14:00 — the fixture's headway exists only for hour 8), so
@@ -274,7 +283,7 @@ func TestPropagate_DoesNotRecordHistory(t *testing.T) {
 	g := buildPropGraph()
 	mgr := state.NewDelayStateManager(rdb, g, nil)
 	hist := NewHistoricalStore(rdb)
-	engine := NewPropagationEngine(g, mgr, hist, nil)
+	engine := NewPropagationEngine(g, mgr, hist, nil, "MTA", Config{}, nil)
 
 	impact := &pb.TransferImpact{
 		FromTripId:         "trip_A1",
@@ -305,7 +314,7 @@ func TestPropagate_DoesNotRecordHistory(t *testing.T) {
 
 func TestEstimateInitialDelay(t *testing.T) {
 	g := buildPropGraph()
-	engine := &PropagationEngine{graph: g}
+	engine := NewPropagationEngine(g, nil, nil, nil, "MTA", Config{}, nil)
 
 	base := &pb.TransferImpact{
 		FromRouteId:        "A",
@@ -313,46 +322,255 @@ func TestEstimateInitialDelay(t *testing.T) {
 		StationId:          "S1",
 		SourceDelaySeconds: 300,
 	}
+	at := func(hour int, wait int32) *pb.TransferImpact {
+		imp := proto.Clone(base).(*pb.TransferImpact)
+		imp.DetectedAt = localUnix(hour)
+		imp.AdditionalWaitSeconds = wait
+		return imp
+	}
 
 	// No wait, no headway (hour 14), no history — legacy linear fallback:
 	// 300 * 0.15 * 0.3 = 13.5 → 14.
-	imp := proto.Clone(base).(*pb.TransferImpact)
-	imp.DetectedAt = localUnix(14)
-	if d := engine.estimateInitialDelay(imp, 0, 0, 0); d != 14 {
+	if d := engine.estimateInitialDelay(at(14, 0), 0, 0, 0, 0); d != 14 {
 		t.Errorf("legacy fallback = %d, want 14", d)
 	}
 
 	// Detector-computed wait dominates when no headway exists.
-	imp = proto.Clone(base).(*pb.TransferImpact)
-	imp.DetectedAt = localUnix(14)
-	imp.AdditionalWaitSeconds = 600
-	if d := engine.estimateInitialDelay(imp, 0, 0, 0); d != 600 {
+	if d := engine.estimateInitialDelay(at(14, 600), 0, 0, 0, 0); d != 600 {
 		t.Errorf("wait-based = %d, want 600", d)
 	}
 
 	// Headway guard: hour 8 has a 600s headway → half = 300 exceeds a small
 	// detector wait of 200.
-	imp = proto.Clone(base).(*pb.TransferImpact)
-	imp.DetectedAt = localUnix(8)
-	imp.AdditionalWaitSeconds = 200
-	if d := engine.estimateInitialDelay(imp, 0, 0, 0); d != 300 {
+	if d := engine.estimateInitialDelay(at(8, 200), 0, 0, 0, 0); d != 300 {
 		t.Errorf("headway-guarded = %d, want 300", d)
 	}
 
-	// Sufficient history blends 60/40 with the schedule estimate:
-	// 0.6*50 + 0.4*300 = 150.
-	imp = proto.Clone(base).(*pb.TransferImpact)
-	imp.DetectedAt = localUnix(8)
-	imp.AdditionalWaitSeconds = 200
-	if d := engine.estimateInitialDelay(imp, 0, 50.0, 10); d != 150 {
-		t.Errorf("history blend = %d, want 150", d)
+	// A connecting route already 200s late pushes the next viable train
+	// later: 300 + 200 = 500.
+	if d := engine.estimateInitialDelay(at(8, 200), 0, 200, 0, 0); d != 500 {
+		t.Errorf("connecting-delay = %d, want 500", d)
 	}
 
-	// Insufficient history (count < 5) — schedule estimate only.
-	imp = proto.Clone(base).(*pb.TransferImpact)
-	imp.DetectedAt = localUnix(8)
-	imp.AdditionalWaitSeconds = 200
-	if d := engine.estimateInitialDelay(imp, 0, 50.0, 3); d != 300 {
-		t.Errorf("low-count = %d, want 300", d)
+	// Connecting delay is capped at one headway (600): 300 + 600 = 900.
+	if d := engine.estimateInitialDelay(at(8, 200), 0, 900, 0, 0); d != 900 {
+		t.Errorf("capped connecting-delay = %d, want 900", d)
 	}
+
+	// History shrinkage: w = 10/(10+10) = 0.5 → 0.5*50 + 0.5*300 = 175.
+	if d := engine.estimateInitialDelay(at(8, 200), 0, 0, 50.0, 10); d != 175 {
+		t.Errorf("history blend = %d, want 175", d)
+	}
+
+	// Sparse history still contributes, weighted lightly:
+	// w = 3/13 → round(3/13*50 + 10/13*300) = 242.
+	if d := engine.estimateInitialDelay(at(8, 200), 0, 0, 50.0, 3); d != 242 {
+		t.Errorf("low-count blend = %d, want 242", d)
+	}
+
+	// Self-propagation (from == to): the train carries its own delay — no
+	// transfer wait, no headway guard, no connecting-delay addition.
+	self := at(8, 200)
+	self.FromRouteId = "L"
+	if d := engine.estimateInitialDelay(self, 0, 400, 0, 0); d != 300 {
+		t.Errorf("self-propagation = %d, want 300 (source delay)", d)
+	}
+}
+
+func brokenLTransfer() *pb.TransferImpact {
+	return &pb.TransferImpact{
+		FromTripId:         "trip_A1",
+		FromRouteId:        "A",
+		ToRouteId:          "L",
+		StationId:          "S1",
+		SourceDelaySeconds: 300,
+		NextViableTripId:   "trip_L1",
+		DetectedAt:         localUnix(8),
+	}
+}
+
+func TestPropagate_CascadeWalksDownstream(t *testing.T) {
+	rdb := skipIfNoRedis(t)
+	defer rdb.Close()
+	ctx := context.Background()
+	rdb.FlushDB(ctx)
+
+	g := buildPropGraph()
+	mgr := state.NewDelayStateManager(rdb, g, nil)
+	hist := NewHistoricalStore(rdb)
+	engine := NewPropagationEngine(g, mgr, hist, nil, "MTA", Config{}, nil)
+
+	result, err := engine.Propagate(ctx, brokenLTransfer())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The cascade onto G must ripple past the transfer station to S5.
+	var sawS5 bool
+	seen := make(map[string]bool)
+	for _, imp := range result.GetImpacts() {
+		key := imp.GetRouteId() + ":" + imp.GetStopId()
+		if seen[key] {
+			t.Errorf("duplicate impact for %s (bounce-back regression)", key)
+		}
+		seen[key] = true
+		if imp.GetRouteId() == "G" && imp.GetStopId() == "S5" {
+			sawS5 = true
+			if imp.GetImpactType() != "cascade_dwell" {
+				t.Errorf("G:S5 impact type = %s, want cascade_dwell", imp.GetImpactType())
+			}
+			if imp.GetHopsFromSource() != 2 {
+				t.Errorf("G:S5 hops = %d, want 2", imp.GetHopsFromSource())
+			}
+		}
+	}
+	if !sawS5 {
+		t.Error("cascade did not walk downstream to G:S5")
+	}
+	if len(result.GetImpacts()) > DefaultConfig().MaxImpacts {
+		t.Errorf("impacts %d exceed cap", len(result.GetImpacts()))
+	}
+}
+
+func TestPropagate_LiveDelayGatesCascade(t *testing.T) {
+	rdb := skipIfNoRedis(t)
+	defer rdb.Close()
+	ctx := context.Background()
+	rdb.FlushDB(ctx)
+
+	g := buildPropGraph()
+	mgr := state.NewDelayStateManager(rdb, g, nil)
+	hist := NewHistoricalStore(rdb)
+	engine := NewPropagationEngine(g, mgr, hist, nil, "MTA", Config{}, nil)
+
+	// Control: with no live delays the cascade onto G fires.
+	result, err := engine.Propagate(ctx, brokenLTransfer())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasRouteImpact(result, "G") {
+		t.Fatal("control run should cascade onto G")
+	}
+
+	// G is already running 400s late at S3: the accumulated L delay (301s)
+	// no longer exceeds min_transfer_time (60) + connecting delay (400), so
+	// the late G train is still catchable and the cascade must not fire.
+	if err := mgr.ProcessEvent(ctx, &pb.DelayEvent{
+		AgencyId: "MTA", TripId: "trip_G1", RouteId: "G", StopId: "S3G",
+		DelaySeconds: 400, ObservedAt: localUnix(8),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	result, err = engine.Propagate(ctx, brokenLTransfer())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasRouteImpact(result, "G") {
+		t.Error("cascade onto G fired despite the connecting route running late")
+	}
+}
+
+func hasRouteImpact(result *pb.PropagationResult, routeID string) bool {
+	for _, imp := range result.GetImpacts() {
+		if imp.GetRouteId() == routeID {
+			return true
+		}
+	}
+	return false
+}
+
+func TestPropagate_ImpactCap(t *testing.T) {
+	rdb := skipIfNoRedis(t)
+	defer rdb.Close()
+	ctx := context.Background()
+	rdb.FlushDB(ctx)
+
+	g := buildPropGraph()
+	mgr := state.NewDelayStateManager(rdb, g, nil)
+	hist := NewHistoricalStore(rdb)
+	engine := NewPropagationEngine(g, mgr, hist, nil, "MTA", Config{MaxImpacts: 3}, nil)
+
+	result, err := engine.Propagate(ctx, brokenLTransfer())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.GetImpacts()) > 3 {
+		t.Errorf("impacts = %d, want <= 3", len(result.GetImpacts()))
+	}
+}
+
+func TestPropagate_PerStopBlend(t *testing.T) {
+	rdb := skipIfNoRedis(t)
+	defer rdb.Close()
+	ctx := context.Background()
+	rdb.FlushDB(ctx)
+
+	g := buildPropGraph()
+	mgr := state.NewDelayStateManager(rdb, g, nil)
+	hist := NewHistoricalStore(rdb)
+	stopStore := NewStopImpactStore(rdb)
+
+	// 10 observed outcomes of 600s at L:S3 during hour 8.
+	for i := 0; i < 10; i++ {
+		if err := stopStore.RecordStopOutcome(ctx, "L", "S3", 8, 600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	engine := NewPropagationEngine(g, mgr, hist, stopStore, "MTA", Config{}, nil)
+	result, err := engine.Propagate(ctx, brokenLTransfer())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Model value at L:S3 is 301; blend = round(0.5*600 + 0.5*301) = 451.
+	for _, imp := range result.GetImpacts() {
+		if imp.GetRouteId() == "L" && imp.GetStopId() == "S3" {
+			if imp.GetPredictedAdditionalDelay() != 451 {
+				t.Errorf("blended L:S3 delay = %d, want 451", imp.GetPredictedAdditionalDelay())
+			}
+			return
+		}
+	}
+	t.Error("no L:S3 impact found")
+}
+
+func TestPropagate_SelfRoute(t *testing.T) {
+	rdb := skipIfNoRedis(t)
+	defer rdb.Close()
+	ctx := context.Background()
+	rdb.FlushDB(ctx)
+
+	g := buildPropGraph()
+	mgr := state.NewDelayStateManager(rdb, g, nil)
+	hist := NewHistoricalStore(rdb)
+	engine := NewPropagationEngine(g, mgr, hist, nil, "MTA", Config{}, nil)
+
+	// Synthetic self-propagation impact, as the gRPC handlers build: a
+	// delayed L train carries its 300s delay down its own line.
+	impact := &pb.TransferImpact{
+		FromTripId:         "trip_L1",
+		FromRouteId:        "L",
+		ToRouteId:          "L",
+		StationId:          "S1",
+		SourceDelaySeconds: 300,
+		NextViableTripId:   "trip_L1",
+		DetectedAt:         localUnix(8),
+	}
+	result, err := engine.Propagate(ctx, impact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.GetImpacts()) == 0 {
+		t.Fatal("self-propagation produced no impacts")
+	}
+	for _, imp := range result.GetImpacts() {
+		if imp.GetRouteId() == "L" && imp.GetStopId() == "S2" {
+			if imp.GetPredictedAdditionalDelay() != 300 {
+				t.Errorf("first-stop delay = %d, want 300 (source delay carried)", imp.GetPredictedAdditionalDelay())
+			}
+			return
+		}
+	}
+	t.Error("no L:S2 impact found")
 }

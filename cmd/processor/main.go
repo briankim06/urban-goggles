@@ -84,12 +84,15 @@ func main() {
 
 	// Propagation engine + publisher.
 	histStore := propagation.NewHistoricalStore(rdb)
-	propEngine := propagation.NewPropagationEngine(g, mgr, histStore, logger)
+	stopStore := propagation.NewStopImpactStore(rdb)
+	propEngine := propagation.NewPropagationEngine(
+		g, mgr, histStore, stopStore, cfg.AgencyID, cfg.Propagation, logger,
+	)
 
 	// Prediction evaluator: tracks predictions, matches them against later
-	// observed delays, and feeds real outcomes back into the history store.
+	// observed delays, and feeds real outcomes back into the history stores.
 	evaluator := evaluation.NewEvaluator(
-		evaluation.NewPendingStore(rdb), g, mgr, histStore, cfg.AgencyID, logger,
+		evaluation.NewPendingStore(rdb), g, mgr, histStore, stopStore, cfg.AgencyID, logger,
 	)
 
 	predPub, err := propagation.NewKafkaPredictionPublisher(cfg.KafkaBrokers, networkPredictionsTopic, 10)

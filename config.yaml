@@ -4,6 +4,19 @@ kafka_brokers:
   - "localhost:9092"
 kafka_topic: "delay-events"
 
+# Propagation model parameters. Omitted or zero values fall back to these
+# defaults.
+propagation:
+  base_dwell_secs: 30
+  dwell_elasticity: 0.3
+  load_increase_pct: 0.15
+  confidence_decay: 0.7
+  min_confidence: 0.2
+  min_delay_threshold_secs: 15
+  max_depth: 5
+  max_impacts: 100
+  per_stop_min_count: 5
+
 feeds:
   - name: "ACE"
     url: "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-ace"

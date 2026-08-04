@@ -18,6 +18,7 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/briankim06/urban-goggles/internal/graph"
+	"github.com/briankim06/urban-goggles/internal/ingest"
 	_ "github.com/briankim06/urban-goggles/internal/metrics" // register metrics
 	"github.com/briankim06/urban-goggles/internal/propagation"
 	"github.com/briankim06/urban-goggles/internal/server"
@@ -32,10 +33,20 @@ func main() {
 	port := flag.Int("port", 50053, "gRPC listen port")
 	agencyID := flag.String("agency", "mta", "agency ID")
 	kafkaBroker := flag.String("kafka", "localhost:9092", "Kafka broker address")
+	configPath := flag.String("config", "config.yaml", "path to config file (for propagation parameters)")
 	flag.Parse()
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
+
+	// Propagation parameters come from the shared config file; fall back to
+	// defaults when it is absent.
+	propCfg := propagation.DefaultConfig()
+	if cfg, err := ingest.LoadConfig(*configPath); err != nil {
+		logger.Warn("config not loaded, using default propagation parameters", "path", *configPath, "err", err)
+	} else {
+		propCfg = cfg.Propagation
+	}
 
 	// Load transit graph.
 	g, err := graph.BuildGraph(*dataDir, time.Now())
@@ -55,9 +66,10 @@ func main() {
 
 	mgr := state.NewDelayStateManager(rdb, g, logger)
 
-	// Propagation engine + historical store.
+	// Propagation engine + historical stores.
 	histStore := propagation.NewHistoricalStore(rdb)
-	propEngine := propagation.NewPropagationEngine(g, mgr, histStore, logger)
+	stopStore := propagation.NewStopImpactStore(rdb)
+	propEngine := propagation.NewPropagationEngine(g, mgr, histStore, stopStore, *agencyID, propCfg, logger)
 
 	// Alert broker: consumes transfer-impacts from Kafka and fans out to
 	// StreamAlerts clients.

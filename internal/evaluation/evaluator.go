@@ -32,9 +32,15 @@ const (
 )
 
 // HistoryRecorder is the slice of propagation.HistoricalStore the evaluator
-// needs; observed outcomes are recorded through it.
+// needs; observed transfer-pair outcomes are recorded through it.
 type HistoryRecorder interface {
 	RecordObservation(ctx context.Context, fromRoute, toRoute, stationID string, hourOfDay, sourceDelay, downstreamImpact int) error
+}
+
+// StopOutcomeRecorder is the slice of propagation.StopImpactStore the
+// evaluator needs; observed per-stop outcomes are recorded through it.
+type StopOutcomeRecorder interface {
+	RecordStopOutcome(ctx context.Context, routeID, stationID string, hour, observedDelay int) error
 }
 
 // Evaluator closes the loop between published predictions and observed
@@ -42,21 +48,24 @@ type HistoryRecorder interface {
 // events against them, and the sweeper finalizes expired pendings into
 // metrics and historical observations.
 type Evaluator struct {
-	pending  *PendingStore
-	graph    *graph.TransitGraph
-	state    *state.DelayStateManager
-	history  HistoryRecorder
-	agencyID string
-	logger   *slog.Logger
+	pending     *PendingStore
+	graph       *graph.TransitGraph
+	state       *state.DelayStateManager
+	history     HistoryRecorder
+	stopHistory StopOutcomeRecorder
+	agencyID    string
+	logger      *slog.Logger
 }
 
 // NewEvaluator wires an evaluator to the pending store, graph, live delay
-// state, and historical store.
+// state, and historical stores. stopHistory may be nil (per-stop outcome
+// recording disabled).
 func NewEvaluator(
 	pending *PendingStore,
 	g *graph.TransitGraph,
 	mgr *state.DelayStateManager,
 	history HistoryRecorder,
+	stopHistory StopOutcomeRecorder,
 	agencyID string,
 	logger *slog.Logger,
 ) *Evaluator {
@@ -64,12 +73,13 @@ func NewEvaluator(
 		logger = slog.Default()
 	}
 	return &Evaluator{
-		pending:  pending,
-		graph:    g,
-		state:    mgr,
-		history:  history,
-		agencyID: agencyID,
-		logger:   logger,
+		pending:     pending,
+		graph:       g,
+		state:       mgr,
+		history:     history,
+		stopHistory: stopHistory,
+		agencyID:    agencyID,
+		logger:      logger,
 	}
 }
 
@@ -271,6 +281,15 @@ func (e *Evaluator) sweepOnce(ctx context.Context, now time.Time) error {
 				int(p.SourceDelaySecs), int(p.ObservedMax),
 			); err != nil {
 				e.logger.Warn("record observation", "err", err, "id", p.ID)
+			}
+		} else if e.stopHistory != nil {
+			// Non-primary outcomes feed the per-stop store (primaries feed
+			// the transfer-pair store; recording them in both would let the
+			// engine double-count the same signal at the first stop).
+			if err := e.stopHistory.RecordStopOutcome(ctx,
+				p.RouteID, p.StationID, p.Hour, int(p.ObservedMax),
+			); err != nil {
+				e.logger.Warn("record stop outcome", "err", err, "id", p.ID)
 			}
 		}
 	}

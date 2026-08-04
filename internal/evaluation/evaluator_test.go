@@ -46,11 +46,12 @@ func buildEvalGraph() *graph.TransitGraph {
 }
 
 type evalFixture struct {
-	rdb   *redis.Client
-	store *PendingStore
-	mgr   *state.DelayStateManager
-	hist  *propagation.HistoricalStore
-	eval  *Evaluator
+	rdb       *redis.Client
+	store     *PendingStore
+	mgr       *state.DelayStateManager
+	hist      *propagation.HistoricalStore
+	stopStore *propagation.StopImpactStore
+	eval      *Evaluator
 }
 
 func newEvalFixture(t *testing.T) *evalFixture {
@@ -62,13 +63,15 @@ func newEvalFixture(t *testing.T) *evalFixture {
 	g := buildEvalGraph()
 	mgr := state.NewDelayStateManager(rdb, g, nil)
 	hist := propagation.NewHistoricalStore(rdb)
+	stopStore := propagation.NewStopImpactStore(rdb)
 	store := NewPendingStore(rdb)
 	return &evalFixture{
-		rdb:   rdb,
-		store: store,
-		mgr:   mgr,
-		hist:  hist,
-		eval:  NewEvaluator(store, g, mgr, hist, "MTA", nil),
+		rdb:       rdb,
+		store:     store,
+		mgr:       mgr,
+		hist:      hist,
+		stopStore: stopStore,
+		eval:      NewEvaluator(store, g, mgr, hist, stopStore, "MTA", nil),
 	}
 }
 
@@ -268,7 +271,14 @@ func TestSweep_WritesObservedOutcomesToHistory(t *testing.T) {
 		Hops: 2, Hour: 8,
 		CreatedAt: now.Unix(), ExpiresAt: now.Unix() + 1,
 	}
-	for _, p := range []*PendingPrediction{verified, falsified, nonPrimary} {
+	nonPrimaryMatched := &PendingPrediction{
+		ID: "A:G:S3:4:0", AgencyID: "MTA", FromRoute: "A", RouteID: "G", StationID: "S3",
+		Direction: -1, SourceDelaySecs: 300, PredictedSecs: 50, Confidence: 0.5,
+		Hops: 2, Hour: 8,
+		CreatedAt: now.Unix(), ExpiresAt: now.Unix() + 1,
+		ObservedMax: 40, Matched: true,
+	}
+	for _, p := range []*PendingPrediction{verified, falsified, nonPrimary, nonPrimaryMatched} {
 		if err := f.store.Add(ctx, p); err != nil {
 			t.Fatal(err)
 		}
@@ -296,9 +306,31 @@ func TestSweep_WritesObservedOutcomesToHistory(t *testing.T) {
 		t.Errorf("falsified history = (%v, %d), want (0, 1)", avg, count)
 	}
 
-	// Non-primary → finalized without touching history.
+	// Non-primary → finalized without touching the transfer-pair history,
+	// but its outcome (0, falsified) lands in the per-stop store.
 	if _, count, _ = f.hist.GetAverageImpact(ctx, "A", "L", "S1", 8); count != 0 {
 		t.Error("non-primary prediction wrote history")
+	}
+	avg, count, err = f.stopStore.GetAverageStopImpact(ctx, "L", "S1", 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 || avg != 0 {
+		t.Errorf("falsified non-primary stop outcome = (%v, %d), want (0, 1)", avg, count)
+	}
+
+	// Matched non-primary records its observed value per-stop.
+	avg, count, err = f.stopStore.GetAverageStopImpact(ctx, "G", "S3", 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 || avg != 40 {
+		t.Errorf("matched non-primary stop outcome = (%v, %d), want (40, 1)", avg, count)
+	}
+
+	// Primaries never write the per-stop store.
+	if _, count, _ = f.stopStore.GetAverageStopImpact(ctx, "L", "S2", 8); count != 0 {
+		t.Error("primary prediction wrote per-stop store")
 	}
 
 	// Everything was claimed; nothing left to pop.

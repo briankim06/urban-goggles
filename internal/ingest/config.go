@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/briankim06/urban-goggles/internal/propagation"
 )
 
 // FeedConfig describes a single GTFS-RT endpoint to poll.
@@ -16,13 +18,15 @@ type FeedConfig struct {
 	Routes       []string      `yaml:"routes"`
 }
 
-// Config is the top-level YAML structure consumed by cmd/ingestor.
+// Config is the top-level YAML structure consumed by cmd/ingestor and
+// cmd/processor.
 type Config struct {
-	AgencyID               string        `yaml:"agency_id"`
-	Feeds                  []FeedConfig  `yaml:"feeds"`
-	PollingDefaultInterval time.Duration `yaml:"polling_default_interval"`
-	KafkaBrokers           []string      `yaml:"kafka_brokers"`
-	KafkaTopic             string        `yaml:"kafka_topic"`
+	AgencyID               string             `yaml:"agency_id"`
+	Feeds                  []FeedConfig       `yaml:"feeds"`
+	PollingDefaultInterval time.Duration      `yaml:"polling_default_interval"`
+	KafkaBrokers           []string           `yaml:"kafka_brokers"`
+	KafkaTopic             string             `yaml:"kafka_topic"`
+	Propagation            propagation.Config `yaml:"propagation"`
 }
 
 // LoadConfig reads and parses a YAML config file from disk.
@@ -46,5 +50,6 @@ func LoadConfig(path string) (*Config, error) {
 			cfg.Feeds[i].PollInterval = cfg.PollingDefaultInterval
 		}
 	}
+	cfg.Propagation = cfg.Propagation.WithDefaults()
 	return &cfg, nil
 }
