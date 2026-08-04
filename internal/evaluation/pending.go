@@ -43,6 +43,12 @@ type PendingPrediction struct {
 	SourceDelaySecs int32   `json:"source_delay_secs"`
 	PredictedSecs   int32   `json:"predicted_secs"`
 	BaselineSecs    int32   `json:"baseline_secs"` // delay already present at prediction time
+	// Schedule frame of the broken connection (detector's effective
+	// seconds-since-midnight). Zero means no connection semantics (old
+	// pendings, self-propagation impacts) — the outcome falls back to
+	// event-matched train delay.
+	SchedConnDepSecs  int32 `json:"sched_conn_dep_secs,omitempty"`
+	EarliestCatchSecs int32 `json:"earliest_catch_secs,omitempty"`
 	Confidence      float64 `json:"confidence"`
 	Hops            int32   `json:"hops"`
 	Hour            int     `json:"hour"`       // hour-of-day at prediction time

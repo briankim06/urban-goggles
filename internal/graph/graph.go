@@ -42,12 +42,52 @@ type TransitGraph struct {
 	// "AFA25GEN-A048-Weekday-00_130200_A..N") to the full static trip ID.
 	// Ambiguous suffixes map to "" and are treated as misses.
 	tripSuffix map[string]string
+
+	// tz is the agency's timezone from agency.txt — all schedule times are
+	// local to it. Nil falls back to the process-local timezone.
+	tz *time.Location
+}
+
+// Location returns the agency timezone the schedule is expressed in,
+// defaulting to the process-local timezone when agency.txt was absent (or
+// for hand-built graphs).
+func (g *TransitGraph) Location() *time.Location {
+	if g == nil || g.tz == nil {
+		return time.Local
+	}
+	return g.tz
+}
+
+// SecsSinceMidnight converts a Unix timestamp to seconds since midnight in
+// the agency's timezone, falling back to the current time when ts is zero.
+// This is the only correct frame for comparing against GTFS schedule times.
+func (g *TransitGraph) SecsSinceMidnight(ts int64) int {
+	t := time.Now().In(g.Location())
+	if ts > 0 {
+		t = time.Unix(ts, 0).In(g.Location())
+	}
+	return t.Hour()*3600 + t.Minute()*60 + t.Second()
 }
 
 // BuildGraph loads all CSV files from dataDir, filters by services active on
 // the given date, and builds every index the engine needs.
 func BuildGraph(dataDir string, date time.Time) (*TransitGraph, error) {
 	logger := slog.Default()
+
+	// The agency timezone governs which service day "date" falls on and all
+	// schedule-time comparisons — a UTC host would otherwise flip service
+	// days at ~8pm ET and shift every time-of-day computation.
+	loc := time.Local
+	if tzName, err := parseAgencyTZ(dataDir); err != nil {
+		logger.Warn("agency.txt unreadable, using process-local timezone", "err", err)
+	} else if tzName != "" {
+		if l, err := time.LoadLocation(tzName); err != nil {
+			logger.Warn("invalid agency_timezone, using process-local timezone", "tz", tzName, "err", err)
+		} else {
+			loc = l
+		}
+	}
+	date = date.In(loc)
 
 	stops, err := parseStops(dataDir)
 	if err != nil {
@@ -151,6 +191,7 @@ func BuildGraph(dataDir string, date time.Time) (*TransitGraph, error) {
 		RoutesAtStop:    routesAtStop,
 		activeTrips:     activeTrips,
 		tripSuffix:      tripSuffix,
+		tz:              loc,
 	}
 	g.BuildHeadwayIndex()
 
@@ -160,6 +201,8 @@ func BuildGraph(dataDir string, date time.Time) (*TransitGraph, error) {
 		"active_trips", len(activeTrips),
 		"transfer_pairs", countTransferPairs(xferByStop),
 		"stop_time_rows", len(allStopTimes),
+		"tz", loc.String(),
+		"service_date", date.Format("2006-01-02"),
 	)
 	return g, nil
 }

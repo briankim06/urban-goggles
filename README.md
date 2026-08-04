@@ -76,11 +76,13 @@ make run-server      # gRPC API on :50051
 ```
 
 > **Timezone & service day**: all time-of-day math (schedule matching,
-> headways, transfer margins) uses the process-local timezone, which must
-> match the agency's. The `make run-*` targets set `TZ=America/New_York`
-> (override with `make run-server TZ=...`). The schedule graph is built once
-> for the boot day's service calendar, so long-running processes should be
-> restarted daily.
+> headways, transfer margins) runs in the agency timezone read from the GTFS
+> static `agency.txt`, falling back to the process-local timezone when it is
+> absent. The `make run-*` targets also pin `TZ=America/New_York` so logs
+> and the fallback stay consistent. The schedule graph is built once for the
+> boot day's service calendar, so long-running processes should be restarted
+> daily (and the static data re-downloaded periodically — an expired
+> calendar means zero active trips).
 
 ## Makefile Targets
 

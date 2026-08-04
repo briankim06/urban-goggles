@@ -271,3 +271,22 @@ func colIndex(hdr []string, names ...string) map[string]int {
 	}
 	return m
 }
+
+// parseAgencyTZ reads agency_timezone from agency.txt. A missing file or
+// column returns "" without error — callers fall back to the process-local
+// timezone.
+func parseAgencyTZ(dataDir string) (string, error) {
+	path := filepath.Join(dataDir, "agency.txt")
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return "", nil
+	}
+	rows, hdr, err := readCSV(path)
+	if err != nil {
+		return "", err
+	}
+	idx := colIndex(hdr, "agency_timezone")
+	if len(rows) == 0 {
+		return "", nil
+	}
+	return strings.TrimSpace(rows[0][idx["agency_timezone"]]), nil
+}

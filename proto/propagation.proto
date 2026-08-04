@@ -14,6 +14,13 @@ message TransferImpact {
   int64 detected_at = 9;
   string next_viable_trip_id = 10;
   int32 additional_wait_seconds = 11;
+  // Schedule frame of the broken connection, in the detector's effective
+  // seconds-since-midnight (may exceed 86400 for post-midnight service):
+  // the departure the passenger would have caught, and the earliest time
+  // they can catch anything after arriving late. Used by the evaluator to
+  // compute realized passenger wait.
+  int32 sched_connection_departure_secs = 12;
+  int32 earliest_catch_secs = 13;
 
   enum ImpactLevel {
     AT_RISK = 0;

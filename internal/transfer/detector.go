@@ -65,9 +65,9 @@ func (d *TransferDetector) EvaluateDelay(ctx context.Context, ev *pb.DelayEvent)
 
 	// Time-of-day in seconds since midnight derived from the event's
 	// scheduled arrival (or observed_at as fallback).
-	scheduledArrSecs := todFromUnix(ev.GetScheduledArrival())
+	scheduledArrSecs := d.todFromUnix(ev.GetScheduledArrival())
 	if scheduledArrSecs == 0 {
-		scheduledArrSecs = todFromUnix(ev.GetObservedAt())
+		scheduledArrSecs = d.todFromUnix(ev.GetObservedAt())
 	}
 
 	var impacts []*pb.TransferImpact
@@ -126,14 +126,18 @@ func (d *TransferDetector) EvaluateDelay(ctx context.Context, ev *pb.DelayEvent)
 				continue // transfer is fine
 			}
 
-			// For broken transfers, find next viable departure.
+			// For broken transfers, find next viable departure and record
+			// the schedule frame so the evaluator can later compute the
+			// passenger's realized wait.
 			var nextViableTripID string
-			var additionalWait int32
+			var additionalWait, schedConnDep, earliestCatchSecs int32
 			if level == pb.TransferImpact_BROKEN {
 				// earliestCatch is already in the effective frame, so the
 				// plain lookup is correct even past 86400.
 				predictedArrSecs := effTod + int(ev.GetDelaySeconds())
 				earliestCatch := predictedArrSecs + minXferTime
+				schedConnDep = int32(nextDep.DepartureSecs)
+				earliestCatchSecs = int32(earliestCatch)
 				viableDeps := d.graph.GetNextDepartures(destStation, toRoute, earliestCatch, 1)
 				if len(viableDeps) > 0 {
 					nextViableTripID = viableDeps[0].TripID
@@ -163,6 +167,8 @@ func (d *TransferDetector) EvaluateDelay(ctx context.Context, ev *pb.DelayEvent)
 				DetectedAt:                    time.Now().Unix(),
 				NextViableTripId:              nextViableTripID,
 				AdditionalWaitSeconds:         additionalWait,
+				SchedConnectionDepartureSecs:  schedConnDep,
+				EarliestCatchSecs:             earliestCatchSecs,
 			}
 			impacts = append(impacts, impact)
 
@@ -210,12 +216,11 @@ func (d *TransferDetector) getConnectingDelay(ctx context.Context, agencyID, rou
 	return maxDelay
 }
 
-// todFromUnix converts a Unix timestamp to seconds since midnight in the local
-// timezone. Returns 0 if ts is 0.
-func todFromUnix(ts int64) int {
+// todFromUnix converts a Unix timestamp to seconds since midnight in the
+// agency's timezone. Returns 0 if ts is 0 (unset).
+func (d *TransferDetector) todFromUnix(ts int64) int {
 	if ts == 0 {
 		return 0
 	}
-	t := time.Unix(ts, 0)
-	return t.Hour()*3600 + t.Minute()*60 + t.Second()
+	return d.graph.SecsSinceMidnight(ts)
 }
