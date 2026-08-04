@@ -26,9 +26,12 @@ type PendingPrediction struct {
 	ID        string `json:"id"`
 	AgencyID  string `json:"agency_id"`
 	FromRoute string `json:"from_route"`
-	RouteID   string `json:"route_id"` // receiving route the impact was predicted on
-	StationID string `json:"station_id"`
-	Direction int    `json:"direction"` // -1 when unknown
+	RouteID   string `json:"route_id"`   // receiving route the impact was predicted on
+	StationID string `json:"station_id"` // impacted stop, used for event matching
+	// SourceStation is the transfer station the prediction originated from —
+	// the station history is keyed by, matching the engine's read side.
+	SourceStation string `json:"source_station,omitempty"`
+	Direction     int    `json:"direction"` // -1 when unknown
 
 	SourceDelaySecs int32   `json:"source_delay_secs"`
 	PredictedSecs   int32   `json:"predicted_secs"`

@@ -58,9 +58,37 @@ func delayKey(agencyID, tripID, stopID string) string {
 	return fmt.Sprintf("delay:%s:%s:%s", agencyID, tripID, stopID)
 }
 
+// clearTripDelays removes every delay key for a cancelled trip. MTA IDs
+// contain no Redis glob metacharacters, so the pattern is safe as-is.
+func (m *DelayStateManager) clearTripDelays(ctx context.Context, agencyID, tripID string) error {
+	pattern := fmt.Sprintf("delay:%s:%s:*", agencyID, tripID)
+	iter := m.rdb.Scan(ctx, 0, pattern, 200).Iterator()
+	var keys []string
+	for iter.Next(ctx) {
+		keys = append(keys, iter.Val())
+	}
+	if err := iter.Err(); err != nil {
+		return fmt.Errorf("scan cancelled trip %s: %w", tripID, err)
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+	m.logger.Debug("trip cancelled, clearing delays", "trip", tripID, "keys", len(keys))
+	return m.rdb.Del(ctx, keys...).Err()
+}
+
 // ProcessEvent ingests a single DelayEvent, applying out-of-order rejection,
 // exponential smoothing, and confidence scoring before writing to Redis.
+// Cancellation and skip events retract state instead of writing it — their
+// delay of 0 must never overwrite a real delay.
 func (m *DelayStateManager) ProcessEvent(ctx context.Context, ev *transit.DelayEvent) error {
+	switch ev.GetType() {
+	case transit.DelayEvent_TRIP_CANCELLED:
+		return m.clearTripDelays(ctx, ev.GetAgencyId(), ev.GetTripId())
+	case transit.DelayEvent_SKIP_STOP:
+		return m.rdb.Del(ctx, delayKey(ev.GetAgencyId(), ev.GetTripId(), ev.GetStopId())).Err()
+	}
+
 	key := delayKey(ev.GetAgencyId(), ev.GetTripId(), ev.GetStopId())
 
 	existing, err := m.getState(ctx, key)
@@ -135,9 +163,15 @@ func (m *DelayStateManager) ProcessEvent(ctx context.Context, ev *transit.DelayE
 	})
 }
 
-// GetDelay reads the current delay state for a specific trip+stop.
+// GetDelay reads the current delay state for a specific trip+stop. It
+// returns (nil, nil) when no state exists — absence is a normal condition,
+// not an error.
 func (m *DelayStateManager) GetDelay(ctx context.Context, agencyID, tripID, stopID string) (*DelayState, error) {
-	return m.getState(ctx, delayKey(agencyID, tripID, stopID))
+	ds, err := m.getState(ctx, delayKey(agencyID, tripID, stopID))
+	if err == redis.Nil {
+		return nil, nil
+	}
+	return ds, err
 }
 
 // GetRouteDelays scans Redis for all delay keys belonging to a route. It uses

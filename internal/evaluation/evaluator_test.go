@@ -183,6 +183,9 @@ func TestTrackPrediction_BaselineAndPrimary(t *testing.T) {
 	if p.Direction != 0 {
 		t.Errorf("direction = %d, want 0 (from next viable trip)", p.Direction)
 	}
+	if p.SourceStation != "S1" {
+		t.Errorf("source station = %q, want S1 (the transfer station)", p.SourceStation)
+	}
 
 	// The S3 dwell impact is tracked but not primary; the 0.2-confidence
 	// cascade impact is filtered out.
@@ -254,7 +257,8 @@ func TestSweep_WritesObservedOutcomesToHistory(t *testing.T) {
 
 	verified := &PendingPrediction{
 		ID: "A:L:S2:1:0", AgencyID: "MTA", FromRoute: "A", RouteID: "L", StationID: "S2",
-		Direction: 0, SourceDelaySecs: 300, PredictedSecs: 100, Confidence: 1.0,
+		SourceStation: "S1",
+		Direction:     0, SourceDelaySecs: 300, PredictedSecs: 100, Confidence: 1.0,
 		Hops: 1, Hour: 8, IsPrimary: true,
 		CreatedAt: now.Unix(), ExpiresAt: now.Unix() + 1,
 		ObservedMax: 80, Matched: true,
@@ -266,7 +270,7 @@ func TestSweep_WritesObservedOutcomesToHistory(t *testing.T) {
 		CreatedAt: now.Unix(), ExpiresAt: now.Unix() + 1,
 	}
 	nonPrimary := &PendingPrediction{
-		ID: "A:L:S1:3:0", AgencyID: "MTA", FromRoute: "A", RouteID: "L", StationID: "S1",
+		ID: "A:L:S4:3:0", AgencyID: "MTA", FromRoute: "A", RouteID: "L", StationID: "S4",
 		Direction: 0, SourceDelaySecs: 300, PredictedSecs: 50, Confidence: 0.5,
 		Hops: 2, Hour: 8,
 		CreatedAt: now.Unix(), ExpiresAt: now.Unix() + 1,
@@ -288,16 +292,21 @@ func TestSweep_WritesObservedOutcomesToHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Verified primary → its observed outcome (80) lands in history.
-	avg, count, err := f.hist.GetAverageImpact(ctx, "A", "L", "S2", 8)
+	// Verified primary → its observed outcome (80) lands in history at the
+	// TRANSFER station (SourceStation), the key the engine reads.
+	avg, count, err := f.hist.GetAverageImpact(ctx, "A", "L", "S1", 8)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if count != 1 || avg != 80 {
 		t.Errorf("verified history = (%v, %d), want (80, 1)", avg, count)
 	}
+	if _, count, _ = f.hist.GetAverageImpact(ctx, "A", "L", "S2", 8); count != 0 {
+		t.Error("history must not be keyed by the impacted stop when SourceStation is set")
+	}
 
-	// Falsified primary → observed outcome 0 lands in history.
+	// Falsified primary without SourceStation (pre-migration pending) →
+	// observed outcome 0 lands at its StationID via the fallback.
 	avg, count, err = f.hist.GetAverageImpact(ctx, "A", "L", "S3", 9)
 	if err != nil {
 		t.Fatal(err)
@@ -308,10 +317,10 @@ func TestSweep_WritesObservedOutcomesToHistory(t *testing.T) {
 
 	// Non-primary → finalized without touching the transfer-pair history,
 	// but its outcome (0, falsified) lands in the per-stop store.
-	if _, count, _ = f.hist.GetAverageImpact(ctx, "A", "L", "S1", 8); count != 0 {
+	if _, count, _ = f.hist.GetAverageImpact(ctx, "A", "L", "S4", 8); count != 0 {
 		t.Error("non-primary prediction wrote history")
 	}
-	avg, count, err = f.stopStore.GetAverageStopImpact(ctx, "L", "S1", 8)
+	avg, count, err = f.stopStore.GetAverageStopImpact(ctx, "L", "S4", 8)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -336,5 +345,63 @@ func TestSweep_WritesObservedOutcomesToHistory(t *testing.T) {
 	// Everything was claimed; nothing left to pop.
 	if left, _ := f.store.PopExpired(ctx, now.Add(time.Hour), 10); len(left) != 0 {
 		t.Errorf("unclaimed pendings remain: %v", left)
+	}
+}
+
+func TestOnDelayEvent_IgnoresNonDelayTypes(t *testing.T) {
+	f := newEvalFixture(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	src, res := testResult(now)
+	if err := f.eval.TrackPrediction(ctx, src, res); err != nil {
+		t.Fatal(err)
+	}
+
+	// A cancellation on the predicted route/station carries delay 0 and must
+	// not be treated as an observed outcome.
+	if err := f.eval.OnDelayEvent(ctx, &pb.DelayEvent{
+		AgencyId: "MTA", TripId: "trip_L1", RouteId: "L", StopId: "S2",
+		ObservedAt: now.Unix() + 300,
+		Type:       pb.DelayEvent_TRIP_CANCELLED,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	active, _ := f.store.FindActive(ctx, "MTA", "L", "S2", now)
+	if len(active) != 1 {
+		t.Fatalf("expected 1 pending, got %d", len(active))
+	}
+	if active[0].Matched {
+		t.Error("TRIP_CANCELLED must not match a pending prediction")
+	}
+}
+
+// TestFeedbackLoop_EngineReadsWhatSweeperWrites is the closed-loop
+// regression: predictions tracked from a transfer impact at station S1 must,
+// after finalization, be readable at the exact history key the propagation
+// engine queries (from-route, to-route, TRANSFER station, hour).
+func TestFeedbackLoop_EngineReadsWhatSweeperWrites(t *testing.T) {
+	f := newEvalFixture(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	src, res := testResult(now)
+	if err := f.eval.TrackPrediction(ctx, src, res); err != nil {
+		t.Fatal(err)
+	}
+
+	// Force expiry and finalize everything.
+	if err := f.eval.sweepOnce(ctx, now.Add(predictionWindowSecs*time.Second+time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	hour := time.Unix(res.GetComputedAt(), 0).Hour()
+	_, count, err := f.hist.GetAverageImpact(ctx, "A", "L", "S1", hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count < 1 {
+		t.Fatalf("engine's read key history:A:L:S1:%d has count %d, want >= 1 — feedback loop not closed", hour, count)
 	}
 }

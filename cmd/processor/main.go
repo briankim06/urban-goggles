@@ -137,6 +137,7 @@ func main() {
 		engine:    propEngine,
 		predPub:   predPub,
 		eval:      evaluator,
+		graph:     g,
 		catchUp:   &catchUp,
 		logger:    logger,
 	}
@@ -182,6 +183,7 @@ type consumerHandler struct {
 	engine   *propagation.PropagationEngine
 	predPub  *propagation.KafkaPredictionPublisher
 	eval     *evaluation.Evaluator
+	graph    *graph.TransitGraph
 	catchUp  *atomic.Bool
 	logger   *slog.Logger
 }
@@ -209,6 +211,11 @@ func (h *consumerHandler) ConsumeClaim(sess sarama.ConsumerGroupSession, claim s
 			sess.MarkMessage(msg, "")
 			continue
 		}
+
+		// Time-only feeds carry delay 0; derive the real delay from the
+		// static schedule before state, evaluation, and detection see it.
+		enrichEvent(h.graph, &ev)
+
 		if err := h.mgr.ProcessEvent(sess.Context(), &ev); err != nil {
 			h.logger.Error("process event", "err", err, "trip", ev.GetTripId())
 		}

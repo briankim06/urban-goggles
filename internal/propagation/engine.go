@@ -100,9 +100,10 @@ func (e *PropagationEngine) Propagate(ctx context.Context, impact *pb.TransferIm
 	}
 	heap.Init(w.pq)
 
-	// Check historical data for a better prediction.
+	// Check historical data for a better prediction. History is keyed by the
+	// parent transfer station, matching what the evaluation sweeper records.
 	histAvg, histCount, _ := e.history.GetAverageImpact(
-		ctx, impact.GetFromRouteId(), toRoute, stationID, w.hour,
+		ctx, impact.GetFromRouteId(), toRoute, e.graph.ParentStationID(stationID), w.hour,
 	)
 
 	connDelay := w.live[toRoute+":"+e.graph.ParentStationID(stationID)]

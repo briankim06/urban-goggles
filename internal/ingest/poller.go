@@ -107,14 +107,17 @@ func (p *Poller) pollOnce(ctx context.Context) {
 	changed := p.Differ.Diff(raw)
 	for _, ev := range changed {
 		if err := p.Publisher.Publish(ctx, ev); err != nil {
+			// Not committed: the event stays a candidate next poll.
 			p.Logger.Error("publish failed", "err", err, "trip", ev.GetTripId(), "stop", ev.GetStopId())
 			continue
 		}
+		p.Differ.Commit(ev)
 		atomic.AddUint64(&p.published, 1)
 		metrics.IngestorEventsTotal.WithLabelValues(ev.GetRouteId()).Inc()
 	}
+	pruned := p.Differ.Prune(time.Now())
 	metrics.IngestorPollDuration.Observe(time.Since(start).Seconds())
-	p.Logger.Debug("poll complete", "raw", len(raw), "emitted", len(changed))
+	p.Logger.Debug("poll complete", "raw", len(raw), "emitted", len(changed), "pruned", pruned)
 }
 
 func (p *Poller) fetch(ctx context.Context) (*gtfsrt.FeedMessage, error) {

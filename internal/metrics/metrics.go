@@ -66,6 +66,14 @@ var (
 			Buckets: []float64{0, 1, 2, 5, 10, 20, 50, 100},
 		},
 	)
+
+	ProcessorEnrichment = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "processor_enrichment_total",
+			Help: "Delay enrichment lookups against the static schedule, by result.",
+		},
+		[]string{"result"}, // hit | miss
+	)
 )
 
 // Server metrics
@@ -178,6 +186,7 @@ func init() {
 		ProcessorActiveDelays,
 		ProcessorBrokenTransfers,
 		ProcessorPropagationFanOut,
+		ProcessorEnrichment,
 		// Server
 		ServerGRPCRequests,
 		ServerGRPCDuration,
