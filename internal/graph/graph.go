@@ -31,6 +31,10 @@ type TransitGraph struct {
 
 	// activeTrips is the set of trip IDs active on the loaded date.
 	activeTrips map[string]bool
+
+	// headways maps route:direction:parentStation:hour → median scheduled
+	// headway in seconds. Built by BuildHeadwayIndex.
+	headways map[string]float64
 }
 
 // BuildGraph loads all CSV files from dataDir, filters by services active on
@@ -126,6 +130,7 @@ func BuildGraph(dataDir string, date time.Time) (*TransitGraph, error) {
 		RoutesAtStop:    routesAtStop,
 		activeTrips:     activeTrips,
 	}
+	g.BuildHeadwayIndex()
 
 	logger.Info("graph built",
 		"stops", len(stops),
