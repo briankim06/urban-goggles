@@ -83,12 +83,14 @@ func main() {
 		}
 	}()
 
-	// Prometheus metrics endpoint.
+	// Prometheus metrics endpoint. Port 9094 (as documented in the README):
+	// Kafka owns 9092 — binding it here silently lost the metrics listener
+	// whenever Kafka was reachable — and the Prometheus UI maps to 9093.
 	go func() {
 		mux := http.NewServeMux()
 		mux.Handle("/metrics", promhttp.Handler())
-		logger.Info("metrics server starting", "addr", ":9092")
-		if err := http.ListenAndServe(":9092", mux); err != nil {
+		logger.Info("metrics server starting", "addr", ":9094")
+		if err := http.ListenAndServe(":9094", mux); err != nil {
 			logger.Error("metrics server", "err", err)
 		}
 	}()

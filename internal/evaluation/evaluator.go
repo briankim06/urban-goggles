@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"sync/atomic"
 	"time"
 
 	"github.com/briankim06/urban-goggles/internal/graph"
@@ -30,6 +31,9 @@ const (
 	// sweepBatchSize bounds how many expired predictions one sweep finalizes.
 	sweepBatchSize = 100
 )
+
+// pendingSeq disambiguates pending IDs created within the same nanosecond.
+var pendingSeq atomic.Uint64
 
 // HistoryRecorder is the slice of propagation.HistoricalStore the evaluator
 // needs; observed transfer-pair outcomes are recorded through it.
@@ -118,9 +122,23 @@ func (e *Evaluator) TrackPrediction(ctx context.Context, src *pb.TransferImpact,
 
 	baselines := e.baselineDelays(ctx, res)
 
+	// Track the primary first: impacts arrive in descending-delay order and
+	// the primary is the smallest hop-1 delay, so a plain in-order loop
+	// could evict it at the cap — exactly during large disruptions.
+	order := make([]int, 0, len(res.GetImpacts()))
+	if primaryIdx >= 0 {
+		order = append(order, primaryIdx)
+	}
+	for i := range res.GetImpacts() {
+		if i != primaryIdx {
+			order = append(order, i)
+		}
+	}
+
 	tracked := 0
 	var firstErr error
-	for i, imp := range res.GetImpacts() {
+	for _, i := range order {
+		imp := res.GetImpacts()[i]
 		if tracked >= maxTracked {
 			break
 		}
@@ -133,9 +151,14 @@ func (e *Evaluator) TrackPrediction(ctx context.Context, src *pb.TransferImpact,
 			direction = toDirection
 		}
 
+		// ID uniqueness needs real wall-clock nanos plus a sequence: `now`
+		// derives from ComputedAt (whole seconds), so same-second
+		// propagations of one pair would otherwise collide and silently
+		// overwrite each other's pendings.
 		p := &PendingPrediction{
 			ID: fmt.Sprintf("%s:%s:%s:%d:%d",
-				src.GetFromRouteId(), imp.GetRouteId(), imp.GetStopId(), now.UnixNano(), i),
+				src.GetFromRouteId(), imp.GetRouteId(), imp.GetStopId(),
+				time.Now().UnixNano(), pendingSeq.Add(1)),
 			AgencyID:        e.agencyID,
 			FromRoute:       src.GetFromRouteId(),
 			RouteID:         imp.GetRouteId(),
@@ -216,7 +239,12 @@ func (e *Evaluator) OnDelayEvent(ctx context.Context, ev *pb.DelayEvent) error {
 		return err
 	}
 
+	// No locking on the read-modify-write below: delay-events is partitioned
+	// by route_id and pendings are matched by route, so every event that can
+	// touch a given pending arrives on one partition and is processed
+	// sequentially.
 	evDir, evDirKnown := e.graph.TripDirection[ev.GetTripId()]
+	var firstErr error
 	for _, p := range pendings {
 		if ev.GetObservedAt() < p.CreatedAt || ev.GetObservedAt() > p.ExpiresAt {
 			continue
@@ -231,12 +259,13 @@ func (e *Evaluator) OnDelayEvent(ctx context.Context, ev *pb.DelayEvent) error {
 		if !p.Matched || additional > p.ObservedMax {
 			p.Matched = true
 			p.ObservedMax = additional
-			if err := e.pending.Update(ctx, p); err != nil {
-				return err
+			// A transient failure on one pending must not abandon the rest.
+			if err := e.pending.Update(ctx, p); err != nil && firstErr == nil {
+				firstErr = err
 			}
 		}
 	}
-	return nil
+	return firstErr
 }
 
 // RunSweeper finalizes expired predictions on the given interval until ctx

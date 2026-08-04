@@ -243,7 +243,7 @@ func (e *PropagationEngine) blendPerStop(ctx context.Context, w *walk, routeID, 
 // routeID at stationID after tod — the next train to leave is the one that
 // inherits a cascade.
 func (e *PropagationEngine) deriveDirection(routeID, stationID string, tod int) (int, bool) {
-	deps := e.graph.GetNextDepartures(stationID, routeID, tod, 1)
+	deps, _ := e.graph.NextDeparturesAfter(stationID, routeID, tod, 1)
 	if len(deps) == 0 {
 		return 0, false
 	}

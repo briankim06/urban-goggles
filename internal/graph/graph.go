@@ -216,6 +216,29 @@ func (g *TransitGraph) GetNextDepartures(stopID, routeID string, afterSecs, n in
 	return out
 }
 
+// overnightWindowSecs bounds the early-morning window in which a wall-clock
+// time-of-day may belong to the previous service day's schedule (GTFS 24:xx+
+// times, aligned with maxHeadwayHour = 27).
+const overnightWindowSecs = 4 * 3600
+
+// NextDeparturesAfter is the wrap-aware form of GetNextDepartures. A
+// time-of-day in the early-morning window may belong to the previous
+// service day's schedule (GTFS 24:xx+ times), so both representations are
+// tried and the one with the smaller wait to its first departure wins.
+// effectiveTod is the representation used — callers computing margins must
+// use it, not the raw tod.
+func (g *TransitGraph) NextDeparturesAfter(stopID, routeID string, tod, n int) (deps []*ScheduledStopTime, effectiveTod int) {
+	deps, effectiveTod = g.GetNextDepartures(stopID, routeID, tod, n), tod
+	if tod < overnightWindowSecs {
+		wrapped := tod + 86400
+		late := g.GetNextDepartures(stopID, routeID, wrapped, n)
+		if len(late) > 0 && (len(deps) == 0 || late[0].DepartureSecs-wrapped < deps[0].DepartureSecs-tod) {
+			return late, wrapped
+		}
+	}
+	return deps, effectiveTod
+}
+
 // GetDownstreamStops returns all stops after stopID on the same trip's route
 // and direction. It finds the trip from the stop times and walks forward.
 func (g *TransitGraph) GetDownstreamStops(routeID, stopID string, directionID int) []*ScheduledStopTime {

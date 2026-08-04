@@ -232,3 +232,67 @@ func TestEvaluateDelay_NoDelay_NoImpact(t *testing.T) {
 		t.Errorf("expected no impacts for on-time train, got %d", len(impacts))
 	}
 }
+
+// TestEvaluateDelay_OvernightTransfer covers the midnight wrap: an arrival
+// just after local midnight must connect against the previous service day's
+// GTFS 24:xx+ trips, not the next morning's first train.
+func TestEvaluateDelay_OvernightTransfer(t *testing.T) {
+	rdb := skipIfNoRedis(t)
+	defer rdb.Close()
+	ctx := context.Background()
+	rdb.FlushDB(ctx)
+
+	g := buildTestGraph()
+	// Overnight service: A arrives 24:30 (88200s); L departs 24:35 (88500s)
+	// and 24:50 (89400s). Appended in sorted order after the morning trips.
+	g.TripRoute["trip_A2"] = "A"
+	g.TripRoute["trip_L3"] = "L"
+	g.TripRoute["trip_L4"] = "L"
+	g.TripDirection["trip_A2"] = 0
+	g.TripDirection["trip_L3"] = 0
+	g.TripDirection["trip_L4"] = 0
+	g.StopTimesByStop["S1"] = append(g.StopTimesByStop["S1"],
+		&graph.ScheduledStopTime{TripID: "trip_A2", StopID: "S1", ArrivalSecs: 88200, DepartureSecs: 88200, StopSequence: 1},
+		&graph.ScheduledStopTime{TripID: "trip_L3", StopID: "S1", ArrivalSecs: 88500, DepartureSecs: 88500, StopSequence: 1},
+		&graph.ScheduledStopTime{TripID: "trip_L4", StopID: "S1", ArrivalSecs: 89400, DepartureSecs: 89400, StopSequence: 1},
+	)
+
+	mgr := state.NewDelayStateManager(rdb, g, nil)
+	det := NewTransferDetector(g, mgr, nil, nil)
+
+	// A arrives scheduled 00:30 local (tod 1800 → effective 88200 = 24:30)
+	// with 240s delay. Margin to L at 24:35 = 300s; remaining = 60 < 120 →
+	// BROKEN. Next viable after 88200+240+120 = 88560 → trip_L4 at 89400;
+	// additional wait = 89400 - 88500 = 900s.
+	ev := &pb.DelayEvent{
+		AgencyId:         "test",
+		TripId:           "trip_A2",
+		RouteId:          "A",
+		StopId:           "S1",
+		DelaySeconds:     240,
+		ObservedAt:       unixAt(0, 30, 0),
+		ScheduledArrival: unixAt(0, 30, 0),
+	}
+
+	impacts, err := det.EvaluateDelay(ctx, ev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(impacts) == 0 {
+		t.Fatal("overnight broken transfer not detected (midnight-wrap regression)")
+	}
+	imp := impacts[0]
+	if imp.Level != pb.TransferImpact_BROKEN {
+		t.Errorf("level = %v, want BROKEN", imp.Level)
+	}
+	if imp.OriginalTransferMarginSeconds != 300 {
+		t.Errorf("margin = %d, want 300 (was ~4.5h against the morning trip before the fix)",
+			imp.OriginalTransferMarginSeconds)
+	}
+	if imp.NextViableTripId != "trip_L4" {
+		t.Errorf("next viable = %q, want trip_L4", imp.NextViableTripId)
+	}
+	if imp.AdditionalWaitSeconds != 900 {
+		t.Errorf("additional_wait = %d, want 900", imp.AdditionalWaitSeconds)
+	}
+}
