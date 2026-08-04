@@ -2,6 +2,7 @@ package evaluation
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -403,5 +404,126 @@ func TestFeedbackLoop_EngineReadsWhatSweeperWrites(t *testing.T) {
 	}
 	if count < 1 {
 		t.Fatalf("engine's read key history:A:L:S1:%d has count %d, want >= 1 — feedback loop not closed", hour, count)
+	}
+}
+
+func TestTrackPrediction_PrimarySurvivesCap(t *testing.T) {
+	f := newEvalFixture(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	// maxTracked+5 impacts in descending-delay order, all above the
+	// confidence filter, with the primary (smallest hop-1 delay on the
+	// receiving route) last — a plain in-order loop would cut it at the cap.
+	src, _ := testResult(now)
+	res := &pb.PropagationResult{ComputedAt: now.Unix()}
+	for i := 0; i < maxTracked+4; i++ {
+		res.Impacts = append(res.Impacts, &pb.DownstreamImpact{
+			RouteId: "G", StopId: fmt.Sprintf("X%d", i),
+			PredictedAdditionalDelay: int32(2000 - i), Confidence: 0.7, HopsFromSource: 2,
+		})
+	}
+	res.Impacts = append(res.Impacts, &pb.DownstreamImpact{
+		RouteId: "L", StopId: "S2",
+		PredictedAdditionalDelay: 300, Confidence: 1.0, HopsFromSource: 1,
+	})
+
+	if err := f.eval.TrackPrediction(ctx, src, res); err != nil {
+		t.Fatal(err)
+	}
+
+	primary, _ := f.store.FindActive(ctx, "MTA", "L", "S2", now)
+	if len(primary) != 1 || !primary[0].IsPrimary {
+		t.Fatalf("primary was evicted by the cap: %v", primary)
+	}
+
+	total := 0
+	for _, imp := range res.GetImpacts() {
+		ps, _ := f.store.FindActive(ctx, "MTA", imp.GetRouteId(), imp.GetStopId(), now)
+		total += len(ps)
+	}
+	if total > maxTracked {
+		t.Errorf("tracked %d pendings, cap is %d", total, maxTracked)
+	}
+}
+
+func TestTrackPrediction_UniqueIDsInSameSecond(t *testing.T) {
+	f := newEvalFixture(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	// Two propagations of the same pair with identical ComputedAt (whole
+	// seconds). Before the fix their pendings shared IDs and the second
+	// silently overwrote the first.
+	src, res := testResult(now)
+	if err := f.eval.TrackPrediction(ctx, src, res); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.eval.TrackPrediction(ctx, src, res); err != nil {
+		t.Fatal(err)
+	}
+
+	active, err := f.store.FindActive(ctx, "MTA", "L", "S2", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(active) != 2 {
+		t.Fatalf("got %d pendings at L/S2, want 2 (same-second ID collision)", len(active))
+	}
+	if active[0].ID == active[1].ID {
+		t.Error("pending IDs must be unique")
+	}
+}
+
+func TestUpdate_DoesNotResurrectFinalized(t *testing.T) {
+	f := newEvalFixture(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	p := &PendingPrediction{
+		ID: "A:L:S2:9:0", AgencyID: "MTA", FromRoute: "A", RouteID: "L", StationID: "S2",
+		Direction: 0, PredictedSecs: 300, Confidence: 1.0, Hops: 1, Hour: 8,
+		CreatedAt: now.Unix(), ExpiresAt: now.Unix() + 1,
+	}
+	if err := f.store.Add(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+
+	// Sweeper claims and deletes it.
+	popped, err := f.store.PopExpired(ctx, now.Add(30*time.Second), 10)
+	if err != nil || len(popped) != 1 {
+		t.Fatalf("PopExpired = (%v, %v), want 1", popped, err)
+	}
+
+	// A racing Update must be a no-op, not a resurrection.
+	p.Matched = true
+	p.ObservedMax = 500
+	if err := f.store.Update(ctx, p); err != nil {
+		t.Fatalf("Update after finalize must return nil, got %v", err)
+	}
+	if n, _ := f.rdb.Exists(ctx, "pending:pred:"+p.ID).Result(); n != 0 {
+		t.Error("Update resurrected a finalized pending as an immortal key")
+	}
+}
+
+func TestAdd_IndexKeyHasTTL(t *testing.T) {
+	f := newEvalFixture(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	p := &PendingPrediction{
+		ID: "A:L:S2:10:0", AgencyID: "MTA", FromRoute: "A", RouteID: "L", StationID: "S2",
+		Direction: 0, PredictedSecs: 300, Confidence: 1.0, Hops: 1, Hour: 8,
+		CreatedAt: now.Unix(), ExpiresAt: now.Unix() + 60,
+	}
+	if err := f.store.Add(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	ttl, err := f.rdb.TTL(ctx, "pending:idx:MTA:L:S2").Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ttl <= 0 {
+		t.Errorf("index ZSET has no TTL (%v) — leaked members would live forever", ttl)
 	}
 }

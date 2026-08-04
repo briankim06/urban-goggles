@@ -18,6 +18,13 @@ const (
 	pendingKeyPrefix = "pending:pred:"
 	indexKeyPrefix   = "pending:idx:"
 	expiryKey        = "pending:expiry"
+
+	// pendingIndexTTL bounds index-ZSET leakage: members whose JSON key
+	// TTL-evicted before sweeping cannot be cleaned individually (their
+	// route/station live only in the JSON), so the whole index expires when
+	// no pendings have been added for this long. Must exceed the prediction
+	// window (30 min) plus the sweeper's slack.
+	pendingIndexTTL = 50 * time.Minute
 )
 
 // PendingPrediction is one tracked downstream-impact prediction awaiting
@@ -78,9 +85,11 @@ func (s *PendingStore) Add(ctx context.Context, p *PendingPrediction) error {
 	if ttl <= 0 {
 		return fmt.Errorf("pending prediction %s already expired", p.ID)
 	}
+	idxKey := indexKey(p.AgencyID, p.RouteID, p.StationID)
 	pipe := s.rdb.Pipeline()
 	pipe.Set(ctx, pendingKey(p.ID), data, ttl)
-	pipe.ZAdd(ctx, indexKey(p.AgencyID, p.RouteID, p.StationID), redis.Z{Score: float64(p.ExpiresAt), Member: p.ID})
+	pipe.ZAdd(ctx, idxKey, redis.Z{Score: float64(p.ExpiresAt), Member: p.ID})
+	pipe.Expire(ctx, idxKey, pendingIndexTTL)
 	pipe.ZAdd(ctx, expiryKey, redis.Z{Score: float64(p.ExpiresAt), Member: p.ID})
 	_, err = pipe.Exec(ctx)
 	return err
@@ -107,13 +116,24 @@ func (s *PendingStore) FindActive(ctx context.Context, agencyID, routeID, statio
 	return out, nil
 }
 
-// Update rewrites a pending prediction in place, preserving its TTL.
+// Update rewrites a pending prediction in place, preserving its TTL. The
+// write is existence-guarded (SET XX): if the sweeper finalized and deleted
+// the pending between FindActive and Update, recreating it here would leave
+// an un-indexed key with no TTL — instead the late observation is dropped,
+// which is correct for an already-finalized prediction.
 func (s *PendingStore) Update(ctx context.Context, p *PendingPrediction) error {
 	data, err := json.Marshal(p)
 	if err != nil {
 		return err
 	}
-	return s.rdb.Set(ctx, pendingKey(p.ID), data, redis.KeepTTL).Err()
+	err = s.rdb.SetArgs(ctx, pendingKey(p.ID), data, redis.SetArgs{
+		Mode:    "XX",
+		KeepTTL: true,
+	}).Err()
+	if err == redis.Nil {
+		return nil // key gone: pending already finalized
+	}
+	return err
 }
 
 // PopExpired atomically claims up to limit predictions whose window ended at
