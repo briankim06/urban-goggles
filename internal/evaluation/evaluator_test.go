@@ -338,3 +338,32 @@ func TestSweep_WritesObservedOutcomesToHistory(t *testing.T) {
 		t.Errorf("unclaimed pendings remain: %v", left)
 	}
 }
+
+func TestOnDelayEvent_IgnoresNonDelayTypes(t *testing.T) {
+	f := newEvalFixture(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	src, res := testResult(now)
+	if err := f.eval.TrackPrediction(ctx, src, res); err != nil {
+		t.Fatal(err)
+	}
+
+	// A cancellation on the predicted route/station carries delay 0 and must
+	// not be treated as an observed outcome.
+	if err := f.eval.OnDelayEvent(ctx, &pb.DelayEvent{
+		AgencyId: "MTA", TripId: "trip_L1", RouteId: "L", StopId: "S2",
+		ObservedAt: now.Unix() + 300,
+		Type:       pb.DelayEvent_TRIP_CANCELLED,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	active, _ := f.store.FindActive(ctx, "MTA", "L", "S2", now)
+	if len(active) != 1 {
+		t.Fatalf("expected 1 pending, got %d", len(active))
+	}
+	if active[0].Matched {
+		t.Error("TRIP_CANCELLED must not match a pending prediction")
+	}
+}

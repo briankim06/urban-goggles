@@ -52,18 +52,45 @@ func NormalizeTripUpdate(
 		routeID = ParseRouteFromTripID(tripID)
 	}
 
+	// A cancelled trip usually carries no StopTimeUpdates. Emit a single
+	// trip-scoped event (empty StopId) so downstream can retract the trip's
+	// delay state.
+	if trip.GetScheduleRelationship() == gtfsrt.TripDescriptor_CANCELED {
+		return []*transit.DelayEvent{{
+			AgencyId:   agencyID,
+			TripId:     tripID,
+			RouteId:    routeID,
+			ObservedAt: observedAt,
+			Type:       transit.DelayEvent_TRIP_CANCELLED,
+		}}
+	}
+
 	events := make([]*transit.DelayEvent, 0, len(tu.GetStopTimeUpdate()))
 	for _, stu := range tu.GetStopTimeUpdate() {
-		delay, predicted, scheduled, ok := extractDelay(stu)
+		// A skipped stop usually carries no arrival/departure events, so it
+		// must be detected before requiring a usable time or delay.
+		if stu.GetScheduleRelationship() == gtfsrt.TripUpdate_StopTimeUpdate_SKIPPED {
+			_, predicted, scheduled, _, _ := extractDelay(stu)
+			events = append(events, &transit.DelayEvent{
+				AgencyId:         agencyID,
+				TripId:           tripID,
+				RouteId:          routeID,
+				StopId:           stu.GetStopId(),
+				ObservedAt:       observedAt,
+				ScheduledArrival: scheduled,
+				PredictedArrival: predicted,
+				Type:             transit.DelayEvent_SKIP_STOP,
+			})
+			continue
+		}
+
+		delay, predicted, scheduled, fromDeparture, ok := extractDelay(stu)
 		if !ok {
 			continue
 		}
 		evType := transit.DelayEvent_ARRIVAL_DELAY
-		if stu.GetArrival() == nil && stu.GetDeparture() != nil {
+		if fromDeparture {
 			evType = transit.DelayEvent_DEPARTURE_DELAY
-		}
-		if stu.GetScheduleRelationship() == gtfsrt.TripUpdate_StopTimeUpdate_SKIPPED {
-			evType = transit.DelayEvent_SKIP_STOP
 		}
 		events = append(events, &transit.DelayEvent{
 			AgencyId:         agencyID,
@@ -80,30 +107,33 @@ func NormalizeTripUpdate(
 	return events
 }
 
-// extractDelay pulls (delay_seconds, predicted_unix, scheduled_unix, ok) out of
-// a StopTimeUpdate. Prefers the arrival event, falling back to departure.
-// MTA feeds typically set `time` but not `delay`, so we compute delay as
-// (predicted - scheduled) when possible. If neither field is usable, ok=false.
-func extractDelay(stu *gtfsrt.TripUpdate_StopTimeUpdate) (delay int32, predicted, scheduled int64, ok bool) {
+// extractDelay pulls (delay_seconds, predicted_unix, scheduled_unix) out of a
+// StopTimeUpdate. Prefers a usable arrival event — one carrying a delay or a
+// time — falling back to the departure when the arrival is absent or empty;
+// fromDeparture reports which was used. MTA feeds typically set `time` but
+// not `delay`; such events carry delay 0 and the processor derives the real
+// delay from the static schedule. If neither event is usable, ok=false.
+func extractDelay(stu *gtfsrt.TripUpdate_StopTimeUpdate) (delay int32, predicted, scheduled int64, fromDeparture, ok bool) {
+	usable := func(ev *gtfsrt.TripUpdate_StopTimeEvent) bool {
+		return ev != nil && (ev.Delay != nil || ev.GetTime() != 0)
+	}
+
 	ev := stu.GetArrival()
-	if ev == nil {
+	if !usable(ev) {
 		ev = stu.GetDeparture()
+		fromDeparture = true
 	}
-	if ev == nil {
-		return 0, 0, 0, false
+	if !usable(ev) {
+		return 0, 0, 0, false, false
 	}
+
 	predicted = ev.GetTime()
 	if ev.Delay != nil {
 		delay = ev.GetDelay()
-		scheduled = predicted - int64(delay)
-		return delay, predicted, scheduled, true
+		if predicted > 0 {
+			scheduled = predicted - int64(delay)
+		}
+		return delay, predicted, scheduled, fromDeparture, true
 	}
-	// No explicit delay — we don't know the static schedule here, so report
-	// a predicted time with zero delay. Step 4 (graph) will enable real
-	// scheduled-vs-predicted subtraction; for now this still lets the diff
-	// layer detect changes over time.
-	if predicted == 0 {
-		return 0, 0, 0, false
-	}
-	return 0, predicted, 0, true
+	return 0, predicted, 0, fromDeparture, true
 }

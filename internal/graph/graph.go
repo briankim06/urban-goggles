@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -35,6 +36,12 @@ type TransitGraph struct {
 	// headways maps route:direction:parentStation:hour → median scheduled
 	// headway in seconds. Built by BuildHeadwayIndex.
 	headways map[string]float64
+
+	// tripSuffix maps the RT-shaped tail of a static trip ID (the substring
+	// after the first underscore, e.g. "130200_A..N" from
+	// "AFA25GEN-A048-Weekday-00_130200_A..N") to the full static trip ID.
+	// Ambiguous suffixes map to "" and are treated as misses.
+	tripSuffix map[string]string
 }
 
 // BuildGraph loads all CSV files from dataDir, filters by services active on
@@ -97,6 +104,20 @@ func BuildGraph(dataDir string, date time.Time) (*TransitGraph, error) {
 		}
 		routesAtStop[parentID][tripRoute[st.TripID]] = true
 	}
+	// Index active trips by their RT-shaped ID suffix for realtime→static
+	// trip resolution.
+	tripSuffix := make(map[string]string, len(byTrip))
+	for tripID := range byTrip {
+		if idx := strings.Index(tripID, "_"); idx >= 0 && idx < len(tripID)-1 {
+			suffix := tripID[idx+1:]
+			if _, dup := tripSuffix[suffix]; dup {
+				tripSuffix[suffix] = "" // ambiguous → miss
+			} else {
+				tripSuffix[suffix] = tripID
+			}
+		}
+	}
+
 	// Sort stop-level lists by departure time, trip-level by stop sequence.
 	for _, v := range byStop {
 		sort.Slice(v, func(i, j int) bool { return v[i].DepartureSecs < v[j].DepartureSecs })
@@ -129,6 +150,7 @@ func BuildGraph(dataDir string, date time.Time) (*TransitGraph, error) {
 		TransfersByStop: xferByStop,
 		RoutesAtStop:    routesAtStop,
 		activeTrips:     activeTrips,
+		tripSuffix:      tripSuffix,
 	}
 	g.BuildHeadwayIndex()
 
@@ -216,6 +238,45 @@ func (g *TransitGraph) GetDownstreamStops(routeID, stopID string, directionID in
 		}
 	}
 	return nil
+}
+
+// ResolveTripID maps a realtime trip ID to a static trip ID present in
+// StopTimesByTrip: exact match first, then the suffix index (MTA RT trip IDs
+// are the tail of the static ID). Ambiguous suffixes are misses.
+func (g *TransitGraph) ResolveTripID(rtTripID string) (string, bool) {
+	if rtTripID == "" {
+		return "", false
+	}
+	if _, ok := g.StopTimesByTrip[rtTripID]; ok {
+		return rtTripID, true
+	}
+	if full, ok := g.tripSuffix[rtTripID]; ok && full != "" {
+		return full, true
+	}
+	return "", false
+}
+
+// GetScheduledStopTime returns the static stop_times row for the trip at the
+// given stop. The stop is matched by raw ID first, then by parent station;
+// the trip is resolved via ResolveTripID.
+func (g *TransitGraph) GetScheduledStopTime(tripID, stopID string) (*ScheduledStopTime, bool) {
+	resolved, ok := g.ResolveTripID(tripID)
+	if !ok {
+		return nil, false
+	}
+	sts := g.StopTimesByTrip[resolved]
+	for _, st := range sts {
+		if st.StopID == stopID {
+			return st, true
+		}
+	}
+	wantParent := parentStation(stopID, g.Stops)
+	for _, st := range sts {
+		if parentStation(st.StopID, g.Stops) == wantParent {
+			return st, true
+		}
+	}
+	return nil, false
 }
 
 // Stats returns human-readable statistics about the loaded graph.

@@ -197,6 +197,9 @@ func (e *Evaluator) baselineDelays(ctx context.Context, res *pb.PropagationResul
 // OnDelayEvent matches an observed delay event against pending predictions
 // for the same route and station, updating their observed maximum.
 func (e *Evaluator) OnDelayEvent(ctx context.Context, ev *pb.DelayEvent) error {
+	if t := ev.GetType(); t != pb.DelayEvent_ARRIVAL_DELAY && t != pb.DelayEvent_DEPARTURE_DELAY {
+		return nil // cancellations/skips carry delay 0 and must not falsify pendings
+	}
 	routeID := ev.GetRouteId()
 	if routeID == "" {
 		routeID = e.graph.TripRoute[ev.GetTripId()]
