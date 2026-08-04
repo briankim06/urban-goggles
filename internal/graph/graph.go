@@ -169,6 +169,9 @@ func BuildGraph(dataDir string, date time.Time) (*TransitGraph, error) {
 	// Build transfer index keyed by parent station.
 	xferByStop := make(map[string][]*Transfer)
 	for _, tf := range transfers {
+		if tf.TransferType == 3 {
+			continue // GTFS type 3: transfers not possible — never a connection
+		}
 		fromParent := parentStation(tf.FromStopID, stops)
 		toParent := parentStation(tf.ToStopID, stops)
 		tf := &Transfer{
